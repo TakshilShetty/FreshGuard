@@ -181,7 +181,7 @@ def render_readouts(latest: Optional[pd.Series], total: int) -> None:
     if latest is not None:
         mq, temp, hum = latest["gas_raw"], latest["temperature_c"], latest["humidity_percent"]
     cards = [
-        readout_card("MQ-135 · raw sensor reading", mq, "ADC", "Raw counts · not ppm", 0, (mq / 4095 * 100) if mq is not None else None, "lime"),
+        readout_card("MQ-3 · raw sensor reading", mq, "ADC", "Raw counts · not ppm", 0, (mq / 4095 * 100) if mq is not None else None, "lime"),
         readout_card("Temperature", temp, "°C", "Simulated placeholder", 1, (temp / 50 * 100) if temp is not None else None, "coral"),
         readout_card("Relative humidity", hum, "% RH", "Simulated placeholder", 1, hum, "sky"),
         readout_card("Total observations", total, "", "Synthetic rows only", 0, None, "mustard"),
@@ -215,8 +215,8 @@ def render_assessment(specimen_id: str, model_trained: bool, timestamp: str) -> 
     </div>
     <div class="sw-explain">
       <b>Why there is no assessment.</b> No model has been trained and no real dataset has been collected,
-      so the system has nothing validated to base a freshness call on. The MQ-135 is a general
-      air-quality gas sensor, not a banana-specific spoilage detector &mdash; a changing reading alone
+      so the system has nothing validated to base a freshness call on. The MQ-3 is an alcohol/vapour
+      gas sensor, not a banana-specific spoilage detector &mdash; a changing reading alone
       cannot show that fruit is spoiled. Values on this screen are <b>simulated</b> and are never
       interpreted as fresh or spoiled.
     </div>
@@ -249,7 +249,7 @@ def render_observations(df: pd.DataFrame, limit: int = 10) -> None:
     )
     table = (
         '<div class="sw-scroll"><table class="sw-table"><thead><tr><th>Timestamp</th><th>Specimen</th>'
-        '<th class="num">MQ-135 raw</th><th class="num">Temp</th><th class="num">Humidity</th><th>Source</th></tr></thead>'
+        '<th class="num">MQ-3 raw</th><th class="num">Temp</th><th class="num">Humidity</th><th>Source</th></tr></thead>'
         f"<tbody>{rows}</tbody></table></div>"
         '<div class="sw-label" style="margin-top:.6rem">Synthetic demo dataset · fixed seed · generated in memory · not from the ESP32</div>'
     )
@@ -288,10 +288,10 @@ def render_signal_trace(df: pd.DataFrame) -> None:
             '<div class="sw-title" style="margin-bottom:.4rem"><span class="idx">06</span>Signal trace'
             f'<span class="tag">{tag("Synthetic · not real measurements", "amber")}</span></div>'
         )
-        t1, t2, t3 = st.tabs(["MQ-135 RAW", "TEMPERATURE", "HUMIDITY"])
+        t1, t2, t3 = st.tabs(["MQ-3 RAW", "TEMPERATURE", "HUMIDITY"])
         cfg = {"displayModeBar": False}
         with t1:
-            st.plotly_chart(_trace(df, "gas_raw", "MQ-135 raw", T.TEAL, "ADC counts"), width="stretch", config=cfg)
+            st.plotly_chart(_trace(df, "gas_raw", "MQ-3 raw", T.TEAL, "ADC counts"), width="stretch", config=cfg)
         with t2:
             st.plotly_chart(_trace(df, "temperature_c", "Temperature", T.CORAL, "°C"), width="stretch", config=cfg)
         with t3:
