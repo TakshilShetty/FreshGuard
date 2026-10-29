@@ -22,12 +22,54 @@ def parse_line(line: str) -> Optional[dict]:
     
     Supports:
     - 3-field standard: gas_raw,temperature_c,humidity_percent
+    - 4-field timestamped: timestamp_ms,gas_raw,temperature_c,humidity_percent
     - 7-field IMU: gas_raw,temperature_c,humidity_percent,accel_x,accel_y,accel_z,shock_g
     - 9-field IMU with tilt: gas_raw,temperature_c,humidity_percent,accel_x,accel_y,accel_z,shock_g,pitch_deg,roll_deg
+    - 10-field IMU timestamped: timestamp_ms,gas_raw,temperature_c,humidity_percent,accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z
     """
     parts = line.strip().split(",")
-    if len(parts) not in (3, 7, 9):
+    if len(parts) not in (3, 4, 7, 9, 10):
         return None
+
+    # Handle 10-field (timestamp_ms,gas,temp,hum,ax,ay,az,gx,gy,gz) and 4-field (timestamp_ms,gas,temp,hum)
+    if len(parts) in (4, 10):
+        try:
+            gas, temp, hum = float(parts[1]), float(parts[2]), float(parts[3])
+        except ValueError:
+            return None
+        if not all(math.isfinite(v) for v in (gas, temp, hum)) or not 0 <= gas <= ADC_MAX or not 0 <= hum <= 100:
+            return None
+
+        data: dict[str, Any] = {"gas_raw": int(round(gas)), "temperature_c": temp, "humidity_percent": hum}
+        if len(parts) == 10:
+            try:
+                raw_ax, raw_ay, raw_az = float(parts[4]), float(parts[5]), float(parts[6])
+                gx, gy, gz = float(parts[7]), float(parts[8]), float(parts[9])
+                mag = math.sqrt(raw_ax**2 + raw_ay**2 + raw_az**2)
+                # Convert from m/s^2 to g if vector magnitude > 4.0
+                if mag > 4.0:
+                    ax, ay, az = raw_ax / 9.80665, raw_ay / 9.80665, raw_az / 9.80665
+                    shock = mag / 9.80665
+                else:
+                    ax, ay, az = raw_ax, raw_ay, raw_az
+                    shock = mag
+                pitch = math.atan2(-ax, math.sqrt(ay**2 + az**2)) * 180.0 / math.pi
+                roll = math.atan2(ay, az) * 180.0 / math.pi
+                data.update({
+                    "accel_x": round(ax, 2),
+                    "accel_y": round(ay, 2),
+                    "accel_z": round(az, 2),
+                    "shock_g": round(shock, 2),
+                    "pitch_deg": round(pitch, 1),
+                    "roll_deg": round(roll, 1),
+                    "gyro_x": round(gx, 3),
+                    "gyro_y": round(gy, 3),
+                    "gyro_z": round(gz, 3),
+                })
+            except ValueError:
+                pass
+        return data
+
     try:
         gas, temp, hum = float(parts[0]), float(parts[1]), float(parts[2])
     except ValueError:

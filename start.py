@@ -108,12 +108,14 @@ def main() -> None:
             )
         )
 
-    # 3. Start Caddy reverse proxy (if available)
+    # 3. Start Caddy reverse proxy (optional convenience)
+    caddy_proc: subprocess.Popen | None = None
     if shutil.which("caddy"):
         caddyfile = Path(tempfile.gettempdir()) / "freshguard.Caddyfile"
         caddyfile.write_text(f":80 {{\n\treverse_proxy 127.0.0.1:{PORT}\n}}\n")
         try:
-            procs.append(subprocess.Popen(["caddy", "run", "--config", str(caddyfile), "--adapter", "caddyfile"]))
+            caddy_proc = subprocess.Popen(["caddy", "run", "--config", str(caddyfile), "--adapter", "caddyfile"])
+            procs.append(caddy_proc)
         except Exception:
             pass
 
@@ -159,8 +161,10 @@ def main() -> None:
     print(f" Network Access:      http://{ip}")
     print(f" Press Ctrl+C to terminate all services.\n")
 
+    # Only treat core services as fatal if they terminate; caddy is optional
+    core_procs = [p for p in procs if p is not caddy_proc]
     try:
-        while all(p.poll() is None for p in procs):
+        while all(p.poll() is None for p in core_procs):
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopping FreshGuard services...")

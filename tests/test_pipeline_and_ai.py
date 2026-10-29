@@ -158,6 +158,15 @@ def test_mpu6050_sensor_reader_parsing():
     assert r9["pitch_deg"] == 2.8
     assert r9["roll_deg"] == -1.2
 
+    # 10-field timestamped IMU with gyro
+    r10 = parse_line("10000,876,29.10,53.30,-5.725,-4.137,-6.160,-0.014,0.067,0.026\n")
+    assert r10["gas_raw"] == 876
+    assert r10["temperature_c"] == 29.10
+    assert r10["humidity_percent"] == 53.30
+    assert abs(r10["shock_g"] - 0.96) < 0.1
+    assert "pitch_deg" in r10
+    assert "roll_deg" in r10
+
 
 def test_dual_health_scores_and_bruise_adjusted_shelf_life():
     """Verify dual health score calculation and bruise shelf-life penalty."""
