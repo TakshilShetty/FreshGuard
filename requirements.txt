@@ -4,3 +4,5 @@ numpy
 plotly
 pytest
 pyserial
+pymongo
+zeroconf

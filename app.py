@@ -7,6 +7,7 @@ model. All measurements shown are synthetic and labelled as such.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 import numpy as np
@@ -40,11 +41,31 @@ def build_demo_dataset(seed: int = T.DEMO_SEED, rows: int = T.DEMO_ROWS) -> pd.D
     )
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def load_readings() -> pd.DataFrame:
+    """Readings for the specimen from MongoDB (freshguard.readings); falls back to the in-memory demo."""
+    try:
+        from pymongo import MongoClient
+
+        col = MongoClient(os.environ.get("MONGO_URI", "mongodb://localhost:27017"), serverSelectionTimeoutMS=2000).freshguard.readings
+        rows = list(col.find({"specimen_id": "BANANA-A"}, {"_id": 0}).sort("timestamp", 1))
+        if rows:
+            df = pd.DataFrame(rows)[["timestamp", "specimen_id", "gas_raw", "temperature_c", "humidity_percent"]]
+            df["source"] = T.DATA_SOURCE
+            df.attrs["origin"] = "MongoDB freshguard.readings"
+            return df
+    except Exception:
+        pass
+    df = build_demo_dataset().copy()
+    df.attrs["origin"] = "in-memory demo (MongoDB unavailable)"
+    return df
+
+
 def _activity_log(df: pd.DataFrame, started: datetime) -> list[tuple[str, str, str, str]]:
     now = f"{started:%Y-%m-%d %H:%M:%S}"
     return [
         (now, "INFO", "cyan", "Dashboard initialized in DEMO MODE."),
-        (now, "INFO", "cyan", f"Synthetic demo dataset loaded: {len(df)} rows, seed {T.DEMO_SEED}, held in memory only."),
+        (now, "INFO", "cyan", f"Synthetic dataset loaded: {len(df)} rows from {df.attrs.get('origin', 'unknown')}."),
         (now, "PENDING", "amber", "Hardware integration pending. No sensor connection has been attempted."),
         (now, "PENDING", "amber", "No real dataset has been collected."),
         (now, "UNAVAILABLE", "crimson", "ML model unavailable: not trained. No spoilage prediction is produced."),
@@ -57,7 +78,7 @@ def main() -> None:
     if "started_at" not in st.session_state:
         st.session_state.started_at = datetime.now().astimezone()
 
-    df = build_demo_dataset()
+    df = load_readings()
     latest = df.iloc[-1]
     last_ts = f"{latest.timestamp:%Y-%m-%d %H:%M:%S} (synthetic)"
 
