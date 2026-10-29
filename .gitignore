@@ -15,3 +15,11 @@ extracted/
 .DS_Store
 Thumbs.db
 
+# Large binary model files (tracked via model bundle in models/)
+*.joblib
+*.pkl
+
+# IDE
+.idea/
+.vscode/
+

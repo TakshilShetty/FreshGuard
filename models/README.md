@@ -1,73 +1,80 @@
 # FreshGuard Machine Learning & AI Engine
 
-This directory stores trained machine learning models for the FreshGuard / SporeWatch banana freshness monitoring pipeline.
+This directory stores trained machine learning model bundles for the FreshGuard banana freshness, spoilage risk, and shelf-life monitoring pipeline.
 
-## Collaborator Quickstart
+## Model Bundle v2.0.0 Architecture
 
-Collaborators working on the AI engine can build, evaluate, and deploy models seamlessly into the live data pipeline without stopping or restarting the backend servers.
+The active model at `models/model.joblib` is a bundled container supporting multi-task inference:
 
-### 1. Model Location & Formats
-Save your trained model file to:
-```text
-models/model.joblib   (Primary format)
-# or
-models/model.pkl      (Secondary pickle format)
+```python
+{
+    "classifier": RandomForestClassifier(...),       # 3-class: FRESH, RIPENING, SPOILED
+    "regressor": GradientBoostingRegressor(...),     # Shelf-life in remaining days
+    "features": ["gas_raw", "temperature_c", "humidity_percent"],
+    "classes": ["FRESH", "RIPENING", "SPOILED"],
+    "thresholds": {...},                             # Per-class empirical ranges
+    "dataset_info": {...},                           # Training metadata & GroupKFold CV scores
+    "version": "2.0.0"
+}
 ```
-The AI Engine (`src/ai_engine.py`) continuously tracks the file's modification timestamp and **automatically hot-reloads** your updated model on the fly.
+
+The AI Engine (`src/ai_engine.py`) continuously tracks the file's modification timestamp and **automatically hot-reloads** any newly saved model on the fly without stopping backend services.
 
 ---
 
-### 2. Expected Inputs & Features
-The model must accept a 2D array or pandas DataFrame with the following standardized feature columns:
+## Capabilities & Outputs
 
-| Feature Name | Type | Description | Typical Range |
-| :--- | :--- | :--- | :--- |
-| `gas_raw` | `float` / `int` | MQ-3 sensor 12-bit ADC reading | `0` to `4095` |
-| `temperature_c` | `float` | Ambient temperature in Celsius | `15.0` to `45.0` |
-| `humidity_percent` | `float` | Relative humidity percentage | `20.0` to `95.0` |
+When a sensor reading arrives from the ESP32 (MQ-3 + DHT22), the engine produces:
+
+| Output Field | Type | Description |
+| :--- | :--- | :--- |
+| `label` | `str` | `FRESH`, `RIPENING`, or `SPOILED` |
+| `confidence` | `float` | Maximum class probability (0.00 – 1.00) |
+| `probabilities` | `dict` | Probabilities for `{FRESH, RIPENING, SPOILED}` |
+| `risk_score` | `float` | Composite spoilage risk score (`0.0` to `100.0%`) |
+| `risk_level` | `str` | `LOW`, `MEDIUM`, `HIGH`, or `CRITICAL` |
+| `shelf_life_days` | `float` | Estimated remaining shelf life in days |
+| `shelf_life_hours` | `float` | Estimated remaining shelf life in hours |
+| `trend` | `dict` | Sliding-window gas slope, rate, and deterioration speed |
+| `alerts` | `list` | Early-warning contextual alerts & threshold warnings |
 
 ---
 
-### 3. Model Interface Requirements
-Your serialized object should expose standard scikit-learn compatible methods:
-- `model.predict(X)`: Returns an array or list of predicted label strings (e.g. `["fresh"]`, `["ripe"]`, `["spoiled"]`, `["no_banana"]`).
-- `model.predict_proba(X)` *(optional but recommended)*: Returns probability distributions across `model.classes_`, enabling the dashboard to display real-time confidence scores.
+## Training a Model
 
----
-
-### 4. Training a Model
-You can use the built-in reference training pipeline:
+### Using the Combined Dataset (Collaborator + Research-Augmented):
 ```bash
 python scripts/train_collaborator_model.py
 ```
-Or customize parameters:
+
+### Using Custom CSV or Excel:
 ```bash
-python scripts/train_collaborator_model.py --data data/demo/demo_5day_3bananas.csv --output models/model.joblib --trees 150
+python scripts/train_collaborator_model.py --excel data/banana_dataset.xlsx
+python scripts/train_collaborator_model.py --data data/external/combined_banana_dataset.csv
 ```
 
 ---
 
-### 5. Testing Your Model
+## Testing Your Model
 
-#### Via Python:
+### Via Python:
 ```python
 from src.ai_engine import predict_sample
 
-result = predict_sample({"gas_raw": 1050, "temperature_c": 28.5, "humidity_percent": 55.0})
-print(result)
-# Output: {'label': 'fresh', 'confidence': 0.88, 'risk_score': 15.0, 'model_source': 'collaborator_model', ...}
+result = predict_sample({"gas_raw": 1950, "temperature_c": 28.5, "humidity_percent": 65.0})
+print(result["label"])            # 'SPOILED'
+print(result["confidence"])       # 0.99
+print(result["shelf_life_days"])  # 0.0
+print(result["risk_level"])       # 'CRITICAL'
+print(result["alerts"])           # [{'level': 'CRITICAL', ...}]
 ```
 
-#### Via Backend REST API:
+### Via REST API:
 ```bash
 curl -X POST http://localhost:8000/api/predict \
      -H "Content-Type: application/json" \
-     -d '{"gas_raw": 1050, "temperature_c": 28.5, "humidity_percent": 55.0}'
+     -d '{"gas_raw": 1950, "temperature_c": 28.5, "humidity_percent": 65.0}'
 ```
 
-#### Via Live Hardware Pipeline:
-When the ESP32 is running, start the pipeline:
-```bash
-python scripts/ingest.py
-```
-Readings from the physical sensors will be fed directly into your model in real time and displayed on the Streamlit dashboard at `http://localhost:5000`.
+### Real-Time WebSocket:
+Connect to `ws://localhost:8000/ws/live` to receive live JSON frames streamed as each ESP32 reading is processed.

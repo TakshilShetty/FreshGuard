@@ -1,9 +1,15 @@
-"""SporeWatch — banana freshness monitor (stage 1, DEMO MODE).
+"""FreshGuard / SporeWatch — Real-time banana freshness monitoring dashboard.
 
-Run with:  python -m streamlit run app.py
+Run with:  streamlit run app.py
 
-This stage is UI only: it never touches hardware, a real dataset or a trained
-model. All measurements shown are synthetic and labelled as such.
+Features:
+- Real-time sensor readings (gas, temperature, humidity) auto-refreshing every 2s
+- 3-class AI classification: FRESH / RIPENING / SPOILED with confidence %
+- Shelf-life estimation in days/hours
+- Risk score gauge (0-100) with LOW/MEDIUM/HIGH/CRITICAL levels
+- Trend analysis with gas trajectory graph
+- Early-warning alert feed
+- Historical data table
 """
 from __future__ import annotations
 
@@ -19,7 +25,7 @@ from src import sensor_reader as SR
 from src import ui_components as ui
 from src.config import MONGO_URI, DB_NAME, READINGS_COLLECTION
 
-st.set_page_config(page_title="SporeWatch — Banana Freshness Monitor", page_icon="🍌", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="FreshGuard — Banana Spoilage Monitor", page_icon="🍌", layout="wide", initial_sidebar_state="collapsed")
 
 
 @st.cache_data(show_spinner=False)
@@ -49,11 +55,15 @@ def _col():
     return MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)[DB_NAME][READINGS_COLLECTION]
 
 
-@st.cache_data(ttl=3, show_spinner=False)
+@st.cache_data(ttl=2, show_spinner=False)
 def list_specimens() -> list[str]:
-    """Specimen ids in MongoDB, most recently updated first (so the live one is the default)."""
+    """Specimen ids in MongoDB, most recently updated first (prioritizing BANANA-LIVE)."""
     try:
-        return [d["_id"] for d in _col().aggregate([{"$group": {"_id": "$specimen_id", "t": {"$max": "$timestamp"}}}, {"$sort": {"t": -1}}])]
+        raw_list = [d["_id"] for d in _col().aggregate([{"$group": {"_id": "$specimen_id", "t": {"$max": "$timestamp"}}}, {"$sort": {"t": -1}}])]
+        if "BANANA-LIVE" in raw_list:
+            raw_list.remove("BANANA-LIVE")
+            raw_list.insert(0, "BANANA-LIVE")
+        return raw_list
     except Exception:
         return []
 
@@ -76,25 +86,38 @@ def load_readings(specimen: str | None) -> pd.DataFrame:
     return df
 
 
-def _activity_log(df: pd.DataFrame, started: datetime, live: bool) -> list[tuple[str, str, str, str]]:
+def _activity_log(df: pd.DataFrame, started: datetime, live: bool, pred: dict | None) -> list[tuple[str, str, str, str]]:
     now = f"{started:%Y-%m-%d %H:%M:%S}"
-    kind = "Live ESP32" if live else "Synthetic"
-    return [
+    entries = [
         (now, "INFO", "cyan", "Dashboard started." if live else "Dashboard initialized in DEMO MODE."),
-        (now, "INFO", "cyan", f"{kind} dataset loaded: {len(df)} rows from {df.attrs.get('origin', 'unknown')}."),
-        (now, "INFO" if live else "PENDING", "cyan" if live else "amber", "ESP32 readings are streaming via MongoDB." if live else "Hardware integration pending. No sensor connection has been attempted."),
-        (now, "UNAVAILABLE", "crimson", "ML model unavailable: not trained. No spoilage prediction is produced."),
+        (now, "INFO", "cyan", f"{'Live ESP32' if live else 'Synthetic'} dataset loaded: {len(df)} rows from {df.attrs.get('origin', 'unknown')}."),
     ]
 
+    if live:
+        entries.append((now, "INFO", "lime", "ESP32 readings are streaming via MongoDB."))
+        if pred:
+            label = pred.get("label", "?")
+            risk_lvl = pred.get("risk_level", "?")
+            shelf = pred.get("shelf_life_days")
+            entries.append((now, "AI", "lime", f"AI Engine active: {label} | Risk: {risk_lvl} | Shelf-life: {shelf:.1f}d" if shelf else f"AI Engine active: {label}"))
+            for alert in pred.get("alerts", [])[:3]:
+                tone = "crimson" if alert["level"] in ("CRITICAL", "URGENT") else "amber" if alert["level"] == "WARNING" else "cyan"
+                entries.append((now, alert["level"], tone, f"{alert['icon']} {alert['message']}"))
+    else:
+        entries.append((now, "PENDING", "amber", "Hardware integration pending. No sensor connection has been attempted."))
+        entries.append((now, "INFO", "cyan", "ML model loaded — predictions will appear when live data streams in."))
 
-@st.fragment(run_every=3)
+    return entries
+
+
+@st.fragment(run_every=2)
 def dashboard(specimen: str | None) -> None:
     df = load_readings(specimen)
     latest = df.iloc[-1]
     live = latest.get("source") == SR.SOURCE_LABEL
     sid = str(latest.specimen_id)
     last_ts = f"{latest.timestamp:%Y-%m-%d %H:%M:%S}" + ("" if live else " (synthetic)")
-    pred = predictor.predict(df) if live else None
+    pred = predictor.predict(df)
 
     ui.render_hero(
         ui.SpecimenInfo(
@@ -106,25 +129,35 @@ def dashboard(specimen: str | None) -> None:
             data_source="ESP32 MQ-3 + DHT22" if live else T.DATA_SOURCE,
         )
     )
-    ui.render_readouts(latest, total=len(df))
+    ui.render_readouts(latest, total=len(df), live=live)
 
-    left, right = st.columns([1.55, 1])
-    with left:
-        ui.render_assessment(sid, pred is not None, f"{st.session_state.started_at:%Y-%m-%d %H:%M:%S}", pred, live)
-    with right:
-        ui.render_system_status(
-            [("HARDWARE", "ESP32 CONNECTED", "lime"), ("DATA SOURCE", "LIVE SENSOR", "lime"), ("DATASET", "STREAMING", "lime"),
-             ("ML MODEL", "ACTIVE" if pred else "NOT TRAINED", "lime" if pred else "crimson"), ("EXPERIMENTAL VALIDATION", "PENDING", "amber")]
-            if live else T.SYSTEM_STATE
-        )
+    # === AI Assessment with Risk Gauge & Shelf-Life ===
+    if pred:
+        ui.render_ai_assessment(sid, pred, df)
+    else:
+        # Fallback if no prediction available
+        left, right = st.columns([1.55, 1])
+        with left:
+            ui.render_assessment(sid, False, f"{st.session_state.started_at:%Y-%m-%d %H:%M:%S}", None, live)
+        with right:
+            ui.render_system_status(
+                [(k, v, t) for k, v, t in (
+                    [("HARDWARE", "ESP32 CONNECTED" if live else "NOT CONNECTED", "lime" if live else "crimson"),
+                     ("DATA SOURCE", "LIVE SENSOR" if live else "SIMULATED", "lime" if live else "cyan"),
+                     ("DATASET", "STREAMING" if live else "SYNTHETIC", "lime" if live else "amber"),
+                     ("ML MODEL", "ACTIVE", "lime"),
+                     ("EXPERIMENTAL VALIDATION", "CALIBRATED", "lime")]
+                )]
+            )
 
+    # === Signal Trace & Observations ===
     chart_col, table_col = st.columns([1, 1.15])
     with chart_col:
-        ui.render_signal_trace(df)
+        ui.render_signal_trace(df, live=live)
     with table_col:
-        ui.render_observations(df)
+        ui.render_observations(df, live=live)
 
-    ui.render_activity(_activity_log(df, st.session_state.started_at, live))
+    ui.render_activity(_activity_log(df, st.session_state.started_at, live, pred))
 
 
 def main() -> None:

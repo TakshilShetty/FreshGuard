@@ -1,24 +1,33 @@
-"""Live End-to-End Data Pipeline for FreshGuard / SporeWatch.
+"""Live End-to-End Data Pipeline for FreshGuard.
 
 Streams sensor telemetry from ESP32 -> Ingests into Backend ->
-Feeds to Collaborator AI Engine -> Writes Raw & Processed Info to MongoDB & Memory Cache ->
-Powers Server APIs and Streamlit Frontend.
+Feeds to AI Engine (3-class classifier + shelf-life regressor + risk scoring) ->
+Writes Raw & Processed Info to MongoDB & Memory Cache ->
+Broadcasts via WebSocket -> Powers Server APIs and Streamlit Frontend.
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import collections
+import json
 import logging
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
 # Ensure project root is in sys.path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import serial
 from pymongo import MongoClient
@@ -38,6 +47,46 @@ logger = logging.getLogger("FreshGuard.Pipeline")
 
 PROCESSED_COLLECTION = "processed_readings"
 
+# Global set of WebSocket clients for live broadcasting
+_ws_clients: Set[Any] = set()
+
+
+def register_ws_client(ws) -> None:
+    _ws_clients.add(ws)
+
+
+def unregister_ws_client(ws) -> None:
+    _ws_clients.discard(ws)
+
+
+async def broadcast_to_clients(data: dict) -> None:
+    """Send data to all connected WebSocket clients."""
+    if not _ws_clients:
+        return
+    # Serialize once, send to all
+    payload = json.dumps(data, default=str)
+    dead = set()
+    for ws in _ws_clients.copy():
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.add(ws)
+    for ws in dead:
+        _ws_clients.discard(ws)
+
+
+def _sync_broadcast(data: dict) -> None:
+    """Fire-and-forget broadcast from sync code."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(broadcast_to_clients(data))
+        else:
+            loop.run_until_complete(broadcast_to_clients(data))
+    except RuntimeError:
+        # No event loop available (pure CLI mode) — skip WS broadcast
+        pass
+
 
 class LivePipeline:
     """Manages continuous ingestion from serial, AI inference, and database dispatch."""
@@ -49,7 +98,7 @@ class LivePipeline:
         specimen_id: str = DEFAULT_SPECIMEN,
         mongo_uri: str = MONGO_URI,
         db_name: str = DB_NAME,
-        cache_size: int = 100,
+        cache_size: int = 200,
         on_reading: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.port = port
@@ -107,7 +156,7 @@ class LivePipeline:
         timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
         sample_id = f"{self.specimen_id}-{now:%Y%m%d%H%M%S}-{self.reading_count:04d}"
 
-        # 1. Feed into AI Engine for inference
+        # 1. Feed into AI Engine for inference (includes trend tracking)
         ai_result = ai_engine.predict_sample(raw_reading)
 
         # 2. Build enriched document matching FreshGuard schema
@@ -119,10 +168,16 @@ class LivePipeline:
             "temperature_c": raw_reading["temperature_c"],
             "humidity_percent": raw_reading["humidity_percent"],
             "source": SOURCE_LABEL,
-            "spoilage_label": ai_result.get("label", "unknown"),
+            # AI predictions
+            "spoilage_label": ai_result.get("label", "UNKNOWN"),
             "confidence": ai_result.get("confidence"),
+            "probabilities": ai_result.get("probabilities", {}),
             "risk_score": ai_result.get("risk_score"),
+            "risk_level": ai_result.get("risk_level"),
+            "shelf_life_days": ai_result.get("shelf_life_days"),
+            "shelf_life_hours": ai_result.get("shelf_life_hours"),
             "model_source": ai_result.get("model_source"),
+            "alerts": ai_result.get("alerts", []),
             "processed": ai_result,
         }
 
@@ -134,7 +189,11 @@ class LivePipeline:
         # 4. Dispatch to MongoDB collections
         if self._readings_col is not None:
             try:
-                self._readings_col.insert_one(document)
+                # Clean document for MongoDB (no nested complex types)
+                mongo_doc = {k: v for k, v in document.items() if k != "processed"}
+                mongo_doc["prediction"] = ai_result
+                self._readings_col.insert_one(mongo_doc)
+
                 if self._processed_col is not None:
                     self._processed_col.insert_one({
                         "sample_id": sample_id,
@@ -148,7 +207,28 @@ class LivePipeline:
             except Exception as exc:
                 logger.warning("MongoDB write failed: %s", exc)
 
-        # 5. Notify external listener / callback if registered
+        # 5. Broadcast to WebSocket clients (non-blocking)
+        ws_payload = {
+            "type": "reading",
+            "timestamp": timestamp_str,
+            "specimen_id": self.specimen_id,
+            "gas_raw": raw_reading["gas_raw"],
+            "temperature_c": raw_reading["temperature_c"],
+            "humidity_percent": raw_reading["humidity_percent"],
+            "label": ai_result.get("label"),
+            "confidence": ai_result.get("confidence"),
+            "probabilities": ai_result.get("probabilities"),
+            "risk_score": ai_result.get("risk_score"),
+            "risk_level": ai_result.get("risk_level"),
+            "shelf_life_days": ai_result.get("shelf_life_days"),
+            "shelf_life_hours": ai_result.get("shelf_life_hours"),
+            "alerts": ai_result.get("alerts", []),
+            "trend": ai_result.get("trend"),
+            "reading_number": self.reading_count,
+        }
+        _sync_broadcast(ws_payload)
+
+        # 6. Notify external listener / callback if registered
         if self.on_reading:
             try:
                 self.on_reading(document)
@@ -173,13 +253,20 @@ class LivePipeline:
         self.running = True
         parser = StreamParser()
 
+        model_file = ai_engine.get_model_file()
+        bundle, _ = ai_engine.load_model_bundle()
+        model_info = "Baseline Heuristic"
+        if bundle and isinstance(bundle, dict):
+            model_info = f"v{bundle.get('version', '?')} ({bundle.get('dataset_info', {}).get('total_readings', '?')} samples)"
+
         print(f"\n=======================================================")
         print(f" FreshGuard Live Sensor -> AI Engine -> Backend Pipeline")
         print(f"=======================================================")
         print(f" Port:          {self.port} (Baud: {self.baud})")
         print(f" Specimen:      {self.specimen_id}")
         print(f" Database:      {self.db_name}.{READINGS_COLLECTION}")
-        print(f" AI Model:      {ai_engine.get_model_file() or 'Baseline Heuristic'}")
+        print(f" AI Model:      {model_file or 'None'} — {model_info}")
+        print(f" Capabilities:  3-class classification + Shelf-life estimation + Risk scoring")
         print(f" Status:        Streaming... (Press Ctrl+C to stop)\n")
 
         while self.running:
@@ -197,18 +284,29 @@ class LivePipeline:
                         if reading:
                             doc = self.process_frame(reading)
                             pred = doc.get("processed", {})
-                            label = pred.get("label", "unknown").upper()
+                            label = pred.get("label", "UNKNOWN")
                             conf = pred.get("confidence")
-                            conf_str = f"{conf:.1%}" if conf is not None else "N/A"
+                            conf_str = f"{conf:.0%}" if conf is not None else "N/A"
                             risk = pred.get("risk_score", 0.0)
+                            risk_lvl = pred.get("risk_level", "?")
+                            shelf = pred.get("shelf_life_days")
+                            shelf_str = f"{shelf:.1f}d" if shelf is not None else "N/A"
 
+                            # Color-coded output
+                            emoji = pred.get("risk_emoji", "")
                             print(
-                                f"[PIPELINE #{self.reading_count:04d}] "
-                                f"Gas: {reading['gas_raw']:4d} ADC | "
-                                f"Temp: {reading['temperature_c']:4.1f}°C | "
-                                f"Hum: {reading['humidity_percent']:4.1f}% | "
-                                f"AI: {label} ({conf_str}, Risk: {risk:.0f}%) -> Saved"
+                                f"{emoji} [#{self.reading_count:04d}] "
+                                f"Gas:{reading['gas_raw']:4d} | "
+                                f"T:{reading['temperature_c']:4.1f}°C | "
+                                f"H:{reading['humidity_percent']:4.1f}% | "
+                                f"{label:9s} ({conf_str}) | "
+                                f"Risk:{risk:4.0f}% {risk_lvl:8s} | "
+                                f"Shelf:{shelf_str}"
                             )
+
+                            # Print alerts
+                            for alert in pred.get("alerts", []):
+                                print(f"   {alert['icon']} [{alert['level']}] {alert['message']}")
 
             except serial.SerialException as s_err:
                 logger.warning("Serial error on %s: %s. Reconnecting in 3s...", self.port, s_err)
@@ -222,6 +320,19 @@ class LivePipeline:
                 time.sleep(2.0)
 
 
+# Singleton pipeline instance for server access
+_pipeline_instance: Optional[LivePipeline] = None
+
+
+def get_pipeline() -> Optional[LivePipeline]:
+    return _pipeline_instance
+
+
+def set_pipeline(pipeline: LivePipeline) -> None:
+    global _pipeline_instance
+    _pipeline_instance = pipeline
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="FreshGuard Live Data & AI Engine Pipeline")
     ap.add_argument("--port", help="Serial port of ESP32 (e.g. COM5)")
@@ -230,6 +341,7 @@ def main() -> None:
     args = ap.parse_args()
 
     pipeline = LivePipeline(port=args.port, baud=args.baud, specimen_id=args.specimen)
+    set_pipeline(pipeline)
     pipeline.run()
 
 

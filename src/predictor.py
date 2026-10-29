@@ -1,7 +1,11 @@
-"""AI hook. predict(df) -> {"label": str, "confidence": float, ...} or None when no trained model exists.
+"""AI hook. predict(df) -> rich prediction dict or None.
 
-Integrates with src.ai_engine to support collaborator-trained models in models/model.joblib,
-as well as dynamic hot-reloading and fallback baseline heuristics.
+Integrates with src.ai_engine to support:
+- 3-class classification (FRESH/RIPENING/SPOILED)
+- Shelf-life estimation in days/hours
+- Risk scoring (0-100, LOW/MEDIUM/HIGH/CRITICAL)
+- Trend analysis and early-warning alerts
+- Hot-reloading of collaborator models from models/model.joblib
 """
 from __future__ import annotations
 
@@ -23,7 +27,7 @@ FEATURES = STANDARD_FEATURES
 
 
 def predict(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Predict spoilage stage and confidence for the latest row of df."""
+    """Predict spoilage stage, confidence, risk, shelf-life for the latest row of df."""
     if df.empty:
         return None
     return predict_dataframe(df)
