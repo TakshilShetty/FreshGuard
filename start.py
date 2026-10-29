@@ -9,7 +9,9 @@ from pathlib import Path
 
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
-NAME, PORT = "freshguard", 5000
+from src.config import DEFAULT_SPECIMEN, MDNS_NAME, PORT
+
+NAME = MDNS_NAME
 HERE = Path(__file__).parent
 
 
@@ -27,7 +29,9 @@ def up(port: int) -> bool:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(); ap.add_argument("--port"); ap.add_argument("--specimen", default="BANANA-LIVE")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port")
+    ap.add_argument("--specimen", default=DEFAULT_SPECIMEN)
     a = ap.parse_args()
     if not up(27017):
         sys.exit("MongoDB is not running on 27017 - start the 'MongoDB' Windows service (admin: net start MongoDB).")
@@ -40,7 +44,8 @@ def main() -> None:
         subprocess.Popen(["caddy", "run", "--config", str(caddyfile), "--adapter", "caddyfile"]),
     ]
     if a.port:
-        procs.append(subprocess.Popen([sys.executable, "ingest.py", "--port", a.port, "--specimen", a.specimen], cwd=HERE))
+        ingest_script = "scripts/ingest.py" if (HERE / "scripts" / "ingest.py").exists() else "ingest.py"
+        procs.append(subprocess.Popen([sys.executable, str(HERE / ingest_script), "--port", a.port, "--specimen", a.specimen], cwd=HERE))
     zc = Zeroconf(ip_version=IPVersion.V4Only)
     zc.register_service(ServiceInfo("_http._tcp.local.", f"{NAME}._http._tcp.local.", addresses=[socket.inet_aton(ip)],
                                     port=80, server=f"{NAME}.local."))

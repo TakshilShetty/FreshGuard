@@ -17,6 +17,7 @@ import streamlit as st
 from src import predictor, ui_theme as T
 from src import sensor_reader as SR
 from src import ui_components as ui
+from src.config import MONGO_URI, DB_NAME, READINGS_COLLECTION
 
 st.set_page_config(page_title="SporeWatch — Banana Freshness Monitor", page_icon="🍌", layout="wide", initial_sidebar_state="collapsed")
 
@@ -45,7 +46,7 @@ def build_demo_dataset(seed: int = T.DEMO_SEED, rows: int = T.DEMO_ROWS) -> pd.D
 def _col():
     from pymongo import MongoClient
 
-    return MongoClient(os.environ.get("MONGO_URI", "mongodb://localhost:27017"), serverSelectionTimeoutMS=2000).freshguard.readings
+    return MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)[DB_NAME][READINGS_COLLECTION]
 
 
 @st.cache_data(ttl=3, show_spinner=False)

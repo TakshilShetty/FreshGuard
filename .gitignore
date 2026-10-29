@@ -1,4 +1,17 @@
+# Python caches and environments
 __pycache__/
 .pytest_cache/
 *.pyc
 .venv/
+venv/
+env/
+
+# Project archives and temp extraction dirs
+archive/
+extracted/
+*.zip
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
