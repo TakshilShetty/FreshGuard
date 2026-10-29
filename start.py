@@ -21,6 +21,12 @@ import tempfile
 import time
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 from src.config import DEFAULT_SPECIMEN, MDNS_NAME, PORT
@@ -33,10 +39,15 @@ HERE = Path(__file__).parent
 def wifi_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("10.255.255.255", 1))
+            s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("10.255.255.255", 1))
+                return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
 
 
 def up(port: int) -> bool:
@@ -70,7 +81,7 @@ def main() -> None:
 
     procs: list[subprocess.Popen] = []
 
-    # 1. Start Streamlit Frontend
+    # 1. Start Streamlit Frontend (bound to 0.0.0.0 for LAN access)
     procs.append(
         subprocess.Popen(
             [
@@ -82,7 +93,11 @@ def main() -> None:
                 "--server.port",
                 str(PORT),
                 "--server.address",
-                "127.0.0.1",
+                "0.0.0.0",
+                "--server.enableCORS",
+                "false",
+                "--server.enableXsrfProtection",
+                "false",
                 "--server.headless",
                 "true",
             ],
@@ -90,7 +105,7 @@ def main() -> None:
         )
     )
 
-    # 2. Start FastAPI Backend REST API Server
+    # 2. Start FastAPI Backend REST API Server (bound to 0.0.0.0 for LAN access)
     if not a.no_api:
         procs.append(
             subprocess.Popen(
@@ -108,11 +123,40 @@ def main() -> None:
             )
         )
 
-    # 3. Start Caddy reverse proxy (optional convenience)
+    # 3. Start Caddy reverse proxy (optional port-80 router for LAN clients)
     caddy_proc: subprocess.Popen | None = None
     if shutil.which("caddy"):
+        # Terminate any orphaned caddy instances to release port 80 & 2019
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "caddy.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.4)
+        except Exception:
+            pass
+
+        caddy_config = f"""{{
+    admin off
+}}
+
+:80 {{
+    handle /api/* {{
+        reverse_proxy 127.0.0.1:8000
+    }}
+    handle /docs* {{
+        reverse_proxy 127.0.0.1:8000
+    }}
+    handle /openapi.json {{
+        reverse_proxy 127.0.0.1:8000
+    }}
+    handle /ws/* {{
+        reverse_proxy 127.0.0.1:8000
+    }}
+    handle {{
+        reverse_proxy 127.0.0.1:{PORT}
+    }}
+}}
+"""
         caddyfile = Path(tempfile.gettempdir()) / "freshguard.Caddyfile"
-        caddyfile.write_text(f":80 {{\n\treverse_proxy 127.0.0.1:{PORT}\n}}\n")
+        caddyfile.write_text(caddy_config, encoding="utf-8")
         try:
             caddy_proc = subprocess.Popen(["caddy", "run", "--config", str(caddyfile), "--adapter", "caddyfile"])
             procs.append(caddy_proc)
@@ -153,12 +197,13 @@ def main() -> None:
         pass
 
     print("\n=======================================================")
-    print(f" FreshGuard System Running Successfully!")
+    print(f" FreshGuard LAN Server Running Successfully! [ONLINE]")
     print(f"=======================================================")
-    print(f" Frontend Dashboard:  http://localhost:{PORT}  |  http://{NAME}.local")
+    print(f" Local Machine:       http://localhost:{PORT}")
+    print(f" LAN Wi-Fi Access:    http://{ip}  (Port 80) or http://{ip}:{PORT}")
+    print(f" mDNS Hostname:       http://{NAME}.local")
     if not a.no_api:
-        print(f" Backend REST API:    http://localhost:8000  (Docs: http://localhost:8000/docs)")
-    print(f" Network Access:      http://{ip}")
+        print(f" REST API (LAN):      http://{ip}/api/status  |  http://{ip}:8000/docs")
     print(f" Press Ctrl+C to terminate all services.\n")
 
     # Only treat core services as fatal if they terminate; caddy is optional
