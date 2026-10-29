@@ -111,3 +111,73 @@ def test_server_api_endpoints():
     p = r_pred.json()["prediction"]
     assert p["label"] == "SPOILED"
     assert p["risk_score"] > 60.0
+
+
+def test_transit_tracker_shocks_and_tilt():
+    """Verify TransitTracker computes peak shock, drops, tilt violations, and bruise penalties."""
+    tracker = ai_engine.TransitTracker(window_size=10)
+
+    # Normal resting readings
+    for _ in range(5):
+        tracker.add({"accel_x": 0.01, "accel_y": 0.02, "accel_z": 0.99, "shock_g": 1.0})
+
+    state = tracker.get_transit_state()
+    assert state["live_shock_g"] == 1.0
+    assert state["tilt_status"] == "LEVEL & UPRIGHT"
+    assert state["severe_drops"] == 0
+    assert state["handling_integrity_score"] == 100.0
+    assert state["bruise_penalty_percent"] == 0.0
+
+    # Severe drop event (3.2g)
+    tracker.add({"accel_x": 0.5, "accel_y": 0.2, "accel_z": 3.1, "shock_g": 3.2, "pitch_deg": 10.0, "roll_deg": 5.0})
+    state_after_drop = tracker.get_transit_state()
+    assert state_after_drop["severe_drops"] == 1
+    assert state_after_drop["peak_shock_g"] == 3.2
+    assert state_after_drop["handling_integrity_score"] < 100.0
+    assert state_after_drop["bruise_penalty_percent"] > 0.0
+    assert len(state_after_drop["incident_log"]) > 0
+    assert state_after_drop["incident_log"][0]["type"] == "SEVERE_DROP"
+
+
+def test_mpu6050_sensor_reader_parsing():
+    """Verify sensor_reader parses 3-field, 7-field, and 9-field CSV lines."""
+    from src.sensor_reader import parse_line
+
+    # Standard 3-field
+    r3 = parse_line("1200,25.5,55.0\n")
+    assert r3 == {"gas_raw": 1200, "temperature_c": 25.5, "humidity_percent": 55.0}
+
+    # 7-field with IMU
+    r7 = parse_line("1200,25.5,55.0,0.02,-0.01,0.98,1.05\n")
+    assert r7["gas_raw"] == 1200
+    assert r7["shock_g"] == 1.05
+    assert r7["accel_z"] == 0.98
+
+    # 9-field with Pitch and Roll
+    r9 = parse_line("1200,25.5,55.0,0.05,-0.02,0.99,1.02,2.8,-1.2\n")
+    assert r9["pitch_deg"] == 2.8
+    assert r9["roll_deg"] == -1.2
+
+
+def test_dual_health_scores_and_bruise_adjusted_shelf_life():
+    """Verify dual health score calculation and bruise shelf-life penalty."""
+    sample = {
+        "gas_raw": 400,
+        "temperature_c": 24.0,
+        "humidity_percent": 50.0,
+        "accel_x": 0.0,
+        "accel_y": 0.0,
+        "accel_z": 3.5,
+        "shock_g": 3.5,
+    }
+    res = ai_engine.predict_sample(sample)
+    assert "bio_freshness_score" in res
+    assert "handling_integrity_score" in res
+    assert "composite_transit_score" in res
+    assert "transit" in res
+    assert res["transit"]["peak_shock_g"] >= 3.5
+    # Shelf life adjusted due to 3.5g drop
+    assert res["shelf_life_days"] <= res["shelf_life_days_baseline"]
+    # Check that transit impact alert was generated
+    impact_alerts = [a for a in res["alerts"] if "IMPACT" in a["message"] or "drop" in a["message"].lower()]
+    assert len(impact_alerts) > 0

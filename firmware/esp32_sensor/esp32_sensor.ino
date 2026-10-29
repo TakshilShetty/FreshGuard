@@ -1,189 +1,160 @@
-from pathlib import Path
+/*
+ * FreshGuard ESP32 Multi-Sensor Transit & Spoilage Firmware
+ * =========================================================
+ * Hardware Configuration:
+ *   - MQ-3 Gas Sensor (Analog ADC: GPIO 34 via voltage divider)
+ *   - DHT22 Temp & Humidity (Digital: GPIO 4)
+ *   - MPU-6050 6-Axis IMU (I2C: SDA=GPIO 21, SCL=GPIO 22)
+ *   - Built-in / Warning LED (GPIO 2)
+ *   - Optional Buzzer (GPIO 13)
+ *
+ * Capabilities:
+ *   - 16-sample ADC oversampling for clean gas readings
+ *   - High-speed 50Hz IMU sampling to capture transient drop/shock peaks
+ *   - Pitch and roll inclination angles calculation
+ *   - Automatic MPU-6050 fallback if disconnected
+ *   - Bidirectional serial commands:
+ *       "ALERT:ON"  -> Turns warning LED/buzzer on
+ *       "ALERT:OFF" -> Turns warning LED/buzzer off
+ *       "RESET_TRIP"-> Resets peak shock counter
+ *
+ * CSV Output Format (every 2 seconds):
+ *   gas_raw,temperature_c,humidity_percent,accel_x,accel_y,accel_z,shock_g,pitch_deg,roll_deg
+ */
 
-import joblib
-import pandas as pd
+#include <Wire.h>
+#include <DHT.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-)
+#define MQ_PIN        34      // MQ-3 analog pin (GPIO34 is input-only ADC1)
+#define DHT_PIN       4       // DHT22 data pin
+#define DHT_TYPE      DHT22   // or DHT11
+#define LED_PIN       2       // Onboard warning LED
+#define BUZZER_PIN    13      // Actuator/Buzzer pin
 
-DATA_FILE = Path("banana_data.csv")
-MODEL_FILE = Path("banana_rf_model.joblib")
+DHT dht(DHT_PIN, DHT_TYPE);
+Adafruit_MPU6050 mpu;
+bool mpu_available = false;
 
-# All three sensor inputs
-FEATURES = [
-    "gas_raw",           # MQ-3
-    "temperature_c",     # DHT22
-    "humidity_percent",  # DHT22
-]
+// Sampling & Telemetry intervals
+unsigned long last_transmit_ms = 0;
+const unsigned long TRANSMIT_INTERVAL_MS = 2000; // Emit telemetry every 2 seconds
 
-LABEL = "spoilage_label"
-ALLOWED_LABELS = {"FRESH", "RIPENING", "SPOILED"}
+// IMU Shock and Orientation metrics
+float peak_shock_g = 1.0;
+float live_ax = 0.0, live_ay = 0.0, live_az = 1.0;
+float live_pitch = 0.0, live_roll = 0.0;
 
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12); // ESP32 12-bit ADC (0 - 4095)
 
-def train_model():
-    if not DATA_FILE.exists():
-        raise FileNotFoundError(
-            f"Dataset not found: {DATA_FILE}"
-        )
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
 
-    df = pd.read_csv(DATA_FILE)
+  dht.begin();
+  Wire.begin(21, 22); // I2C pins: SDA=21, SCL=22
+  Wire.setClock(400000); // 400kHz Fast Mode I2C
 
-    required = FEATURES + [LABEL, "sample_id"]
-    missing = [col for col in required if col not in df.columns]
+  // Initialize MPU-6050
+  if (mpu.begin()) {
+    mpu_available = true;
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  } else {
+    Serial.println("# WARNING: MPU-6050 not detected. Continuing in gas-only mode.");
+  }
 
-    if missing:
-        raise ValueError(f"Missing CSV columns: {missing}")
+  delay(1200);
+  // CSV Header
+  Serial.println("gas_raw,temperature_c,humidity_percent,accel_x,accel_y,accel_z,shock_g,pitch_deg,roll_deg");
+}
 
-    # Normalize labels and convert sensor values to numbers.
-    df[LABEL] = df[LABEL].astype(str).str.strip().str.upper()
+void process_serial_commands() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "ALERT:ON") {
+      digitalWrite(LED_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+    } else if (cmd == "ALERT:OFF") {
+      digitalWrite(LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+    } else if (cmd == "RESET_TRIP") {
+      peak_shock_g = 1.0;
+    }
+  }
+}
 
-    for col in FEATURES:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+void loop() {
+  process_serial_commands();
 
-    # Remove incomplete or invalid rows.
-    df = df.dropna(subset=required)
-    df = df[df[LABEL].isin(ALLOWED_LABELS)].copy()
+  // High-frequency IMU loop (~50Hz) to capture instantaneous impacts & drops
+  if (mpu_available) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
 
-    if df.empty or df[LABEL].nunique() < 2:
-        raise ValueError(
-            "Need valid readings with at least two freshness classes."
-        )
+    // Convert m/s^2 to standard Earth gravity (g)
+    live_ax = a.acceleration.x / 9.80665;
+    live_ay = a.acceleration.y / 9.80665;
+    live_az = a.acceleration.z / 9.80665;
 
-    # Each banana sample must belong to only one split.
-    if df["sample_id"].nunique() < 2:
-        raise ValueError(
-            "Collect readings from multiple banana samples "
-            "before evaluating the model."
-        )
+    // Instantaneous total acceleration vector magnitude
+    float current_shock = sqrt(live_ax * live_ax + live_ay * live_ay + live_az * live_az);
+    if (current_shock > peak_shock_g) {
+      peak_shock_g = current_shock;
+    }
 
-    X = df[FEATURES]
-    y = df[LABEL]
-    groups = df["sample_id"]
+    // Pitch and Roll calculation (in degrees)
+    live_pitch = atan2(-live_ax, sqrt(live_ay * live_ay + live_az * live_az)) * 180.0 / PI;
+    live_roll  = atan2(live_ay, live_az) * 180.0 / PI;
+  }
 
-    splitter = GroupShuffleSplit(
-        n_splits=1,
-        test_size=0.25,
-        random_state=42,
-    )
+  // Periodic Telemetry Transmission
+  unsigned long now = millis();
+  if (now - last_transmit_ms >= TRANSMIT_INTERVAL_MS) {
+    last_transmit_ms = now;
 
-    train_idx, test_idx = next(
-        splitter.split(X, y, groups=groups)
-    )
+    // 16-sample oversampling for MQ-3 analog noise reduction
+    long gas_sum = 0;
+    for (int i = 0; i < 16; i++) {
+      gas_sum += analogRead(MQ_PIN);
+      delay(2);
+    }
+    int gas_raw = gas_sum / 16;
 
-    X_train = X.iloc[train_idx]
-    X_test = X.iloc[test_idx]
-    y_train = y.iloc[train_idx]
-    y_test = y.iloc[test_idx]
+    // Read DHT22
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
 
-    if y_train.nunique() < 2:
-        raise ValueError(
-            "Training split has fewer than two classes. "
-            "Collect more banana samples across the classes."
-        )
+    if (!isnan(t) && !isnan(h)) {
+      // Format: gas_raw,temperature_c,humidity_percent,accel_x,accel_y,accel_z,shock_g,pitch_deg,roll_deg
+      Serial.print(gas_raw);
+      Serial.print(",");
+      Serial.print(t, 1);
+      Serial.print(",");
+      Serial.print(h, 1);
+      Serial.print(",");
+      Serial.print(live_ax, 2);
+      Serial.print(",");
+      Serial.print(live_ay, 2);
+      Serial.print(",");
+      Serial.print(live_az, 2);
+      Serial.print(",");
+      Serial.print(peak_shock_g, 2);
+      Serial.print(",");
+      Serial.print(live_pitch, 1);
+      Serial.print(",");
+      Serial.println(live_roll, 1);
+    }
 
-    model = RandomForestClassifier(
-        n_estimators=200,
-        class_weight="balanced",
-        random_state=42,
-        n_jobs=-1,
-    )
+    // Decay peak shock towards 1.0g for next interval
+    peak_shock_g = 1.0;
+  }
 
-    model.fit(X_train, y_train)
-
-    predictions = model.predict(X_test)
-
-    print("\n--- MODEL EVALUATION ---")
-    print("Accuracy:", round(
-        accuracy_score(y_test, predictions), 3
-    ))
-
-    print("\nClassification report:")
-    print(classification_report(
-        y_test,
-        predictions,
-        labels=sorted(ALLOWED_LABELS),
-        zero_division=0,
-    ))
-
-    print("Confusion matrix (alphabetical label order):")
-    print(sorted(ALLOWED_LABELS))
-    print(confusion_matrix(
-        y_test,
-        predictions,
-        labels=sorted(ALLOWED_LABELS),
-    ))
-
-    # Save the trained model and feature order.
-    joblib.dump(
-        {
-            "model": model,
-            "features": FEATURES,
-        },
-        MODEL_FILE,
-    )
-
-    print(f"\nModel saved to: {MODEL_FILE.resolve()}")
-
-    print("\nFeature importance:")
-    importance = pd.Series(
-        model.feature_importances_,
-        index=FEATURES,
-    ).sort_values(ascending=False)
-
-    print(importance)
-
-
-def predict_freshness(gas_raw, temperature_c, humidity_percent):
-    if not MODEL_FILE.exists():
-        raise FileNotFoundError(
-            "Model not found. Run train_model() first."
-        )
-
-    saved = joblib.load(MODEL_FILE)
-    model = saved["model"]
-    features = saved["features"]
-
-    # Build one row using the exact training feature order.
-    readings = pd.DataFrame([{
-        "gas_raw": gas_raw,
-        "temperature_c": temperature_c,
-        "humidity_percent": humidity_percent,
-    }])[features]
-
-    readings = readings.apply(pd.to_numeric, errors="coerce")
-
-    if readings.isna().any().any():
-        raise ValueError("Sensor readings must be valid numbers.")
-
-    prediction = model.predict(readings)[0]
-    probabilities = model.predict_proba(readings)[0]
-
-    print("\n--- LIVE PREDICTION ---")
-    print("Predicted banana status:", prediction)
-    print("Class probabilities:")
-
-    for label, probability in zip(model.classes_, probabilities):
-        print(f"  {label}: {probability:.1%}")
-
-    return prediction
-
-
-if __name__ == "__main__":
-    # Train and evaluate using the labelled CSV.
-    train_model()
-
-    # After training, call predict_freshness() whenever
-    # your ESP32 software supplies a new sensor reading.
-    #
-    # Example values ONLY:
-    #
-    # predict_freshness(
-    #     gas_raw=1700,
-    #     temperature_c=28.0,
-    #     humidity_percent=68.0,
-    # )
+  delay(20); // 50Hz IMU polling cycle
+}

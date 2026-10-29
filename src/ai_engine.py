@@ -147,6 +147,192 @@ def get_trend_tracker() -> TrendTracker:
 
 
 # ---------------------------------------------------------------------------
+# Transit tracker — MPU-6050 physical handling, shock, tilt, and road stress
+# ---------------------------------------------------------------------------
+class TransitTracker:
+    """Tracks physical transit telemetry: shocks, drops, orientation, vibrations, and handling stress."""
+
+    def __init__(self, window_size: int = 40) -> None:
+        self.window_size = window_size
+        self.readings: Deque[Dict[str, Any]] = deque(maxlen=window_size)
+        self.peak_shock_g: float = 1.0
+        self.severe_drop_count: int = 0
+        self.mild_bump_count: int = 0
+        self.tilt_violation_count: int = 0
+        self.incident_log: Deque[Dict[str, Any]] = deque(maxlen=20)
+        self._last_incident_time: float = 0.0
+
+    def add(self, reading: Dict[str, Any]) -> None:
+        raw_ts = reading.get("timestamp", time.time())
+        if isinstance(raw_ts, (int, float)):
+            ts_str = time.strftime("%H:%M:%S", time.localtime(raw_ts))
+            now_sec = float(raw_ts)
+        else:
+            ts_str = str(raw_ts).split()[-1] if " " in str(raw_ts) else str(raw_ts)
+            now_sec = time.time()
+
+        # Acceleration in g's
+        ax = float(reading.get("accel_x", 0.0))
+        ay = float(reading.get("accel_y", 0.0))
+        az = float(reading.get("accel_z", 1.0))
+
+        # Instantaneous total shock magnitude
+        if "shock_g" in reading and float(reading["shock_g"]) > 0:
+            shock = float(reading["shock_g"])
+        else:
+            shock = float(np.sqrt(ax * ax + ay * ay + az * az))
+        if not np.isfinite(shock) or shock <= 0:
+            shock = 1.0
+
+        # Pitch and Roll in degrees
+        if "pitch_deg" in reading:
+            pitch = float(reading["pitch_deg"])
+        else:
+            pitch = float(np.degrees(np.arctan2(-ax, np.sqrt(ay * ay + az * az))))
+
+        if "roll_deg" in reading:
+            roll = float(reading["roll_deg"])
+        else:
+            roll = float(np.degrees(np.arctan2(ay, az)))
+
+        if shock > self.peak_shock_g:
+            self.peak_shock_g = round(shock, 2)
+
+        # Incident logging with 1.5s rate-limit
+        can_log = (now_sec - self._last_incident_time) >= 1.5
+
+        if shock >= 2.5:
+            self.severe_drop_count += 1
+            if can_log:
+                self.incident_log.append({
+                    "timestamp": ts_str,
+                    "type": "SEVERE_DROP",
+                    "severity": f"{shock:.1f}g",
+                    "level": "CRITICAL",
+                    "icon": "💥",
+                    "message": f"High impact drop ({shock:.1f}g). Severe bruising risk.",
+                })
+                self._last_incident_time = now_sec
+        elif shock >= 1.6:
+            self.mild_bump_count += 1
+            if can_log and len(self.incident_log) < 20:
+                self.incident_log.append({
+                    "timestamp": ts_str,
+                    "type": "MILD_BUMP",
+                    "severity": f"{shock:.1f}g",
+                    "level": "CAUTION",
+                    "icon": "⚠️",
+                    "message": f"Transit bump detected ({shock:.1f}g).",
+                })
+                self._last_incident_time = now_sec
+
+        # Tilt violations (>35 degrees)
+        is_tilted = abs(pitch) > 35.0 or abs(roll) > 35.0
+        if is_tilted:
+            self.tilt_violation_count += 1
+            if can_log and (now_sec - self._last_incident_time) >= 4.0:
+                self.incident_log.append({
+                    "timestamp": ts_str,
+                    "type": "TILT_VIOLATION",
+                    "severity": f"P:{pitch:.0f}° R:{roll:.0f}°",
+                    "level": "WARNING",
+                    "icon": "📦",
+                    "message": f"Crate tilted (Pitch: {pitch:.0f}°, Roll: {roll:.0f}°). Risk of crush injury.",
+                })
+                self._last_incident_time = now_sec
+
+        self.readings.append({
+            "accel_x": ax, "accel_y": ay, "accel_z": az,
+            "shock_g": shock, "pitch_deg": pitch, "roll_deg": roll,
+            "timestamp": ts_str,
+        })
+
+    def get_transit_state(self) -> Dict[str, Any]:
+        """Compute transit indicators, handling integrity, and bruise penalty."""
+        if not self.readings:
+            return {
+                "live_shock_g": 1.0,
+                "peak_shock_g": 1.0,
+                "accel_x": 0.0, "accel_y": 0.0, "accel_z": 1.0,
+                "pitch_deg": 0.0, "roll_deg": 0.0,
+                "tilt_status": "LEVEL & UPRIGHT",
+                "road_condition": "STATIONARY",
+                "vibration_rms": 0.0,
+                "severe_drops": 0,
+                "mild_bumps": 0,
+                "tilt_violations": 0,
+                "handling_integrity_score": 100.0,
+                "bruise_penalty_percent": 0.0,
+                "incident_log": [],
+            }
+
+        latest = self.readings[-1]
+        shocks = [r["shock_g"] for r in self.readings]
+
+        # Vibration RMS: deviation from 1.0g
+        devs = [s - 1.0 for s in shocks]
+        rms = float(np.sqrt(np.mean(np.square(devs))))
+
+        if rms < 0.12:
+            road = "STATIONARY"
+        elif rms < 0.45:
+            road = "SMOOTH_HIGHWAY"
+        else:
+            road = "ROUGH_ROAD"
+
+        pitch = latest["pitch_deg"]
+        roll = latest["roll_deg"]
+        az = latest["accel_z"]
+
+        if az < -0.3:
+            tilt = "INVERTED (UPSIDE DOWN)"
+        elif abs(pitch) > 45 or abs(roll) > 45:
+            tilt = "CRITICAL TILT / TIPPING"
+        elif abs(pitch) > 25 or abs(roll) > 25:
+            tilt = "MODERATE TILT"
+        else:
+            tilt = "LEVEL & UPRIGHT"
+
+        # Physical Handling Integrity (starts at 100)
+        drop_loss = self.severe_drop_count * 15.0
+        bump_loss = min(20.0, self.mild_bump_count * 2.0)
+        tilt_loss = min(15.0, (self.tilt_violation_count // 5) * 3.0)
+        rough_loss = 10.0 if road == "ROUGH_ROAD" else 0.0
+
+        integrity = max(0.0, 100.0 - (drop_loss + bump_loss + tilt_loss + rough_loss))
+
+        # Bruise penalty on shelf life
+        penalty = min(0.70, (self.severe_drop_count * 0.15) + (self.mild_bump_count * 0.02) + (0.05 if road == "ROUGH_ROAD" else 0.0))
+
+        return {
+            "live_shock_g": round(latest["shock_g"], 2),
+            "peak_shock_g": round(self.peak_shock_g, 2),
+            "accel_x": round(latest["accel_x"], 2),
+            "accel_y": round(latest["accel_y"], 2),
+            "accel_z": round(latest["accel_z"], 2),
+            "pitch_deg": round(pitch, 1),
+            "roll_deg": round(roll, 1),
+            "tilt_status": tilt,
+            "road_condition": road,
+            "vibration_rms": round(rms, 3),
+            "severe_drops": self.severe_drop_count,
+            "mild_bumps": self.mild_bump_count,
+            "tilt_violations": self.tilt_violation_count,
+            "handling_integrity_score": round(integrity, 1),
+            "bruise_penalty_percent": round(penalty * 100.0, 1),
+            "incident_log": list(self.incident_log)[::-1],  # newest first
+        }
+
+
+# Global transit tracker instance
+_transit_tracker = TransitTracker(window_size=60)
+
+
+def get_transit_tracker() -> TransitTracker:
+    return _transit_tracker
+
+
+# ---------------------------------------------------------------------------
 # Model loading with hot-reload
 # ---------------------------------------------------------------------------
 def get_model_file() -> Optional[Path]:
@@ -284,6 +470,7 @@ def generate_alerts(
     trend: Optional[Dict[str, Any]],
     gas_raw: float,
     temp_c: float,
+    transit: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
     """Generate context-aware alerts based on the current state."""
     alerts = []
@@ -322,13 +509,36 @@ def generate_alerts(
         alerts.append({"level": "WARNING", "icon": "💨",
                         "message": f"Very high gas reading ({gas_raw} ADC) — strong VOC emission detected."})
 
+    # MPU-6050 Transit Telemetry Alerts
+    if transit:
+        shock = transit.get("live_shock_g", 1.0)
+        if shock >= 2.5:
+            alerts.append({"level": "CRITICAL", "icon": "💥",
+                            "message": f"SEVERE IMPACT DETECTED ({shock:.1f}g) — crate dropped! Bruising cuts shelf life."})
+        elif shock >= 1.6:
+            alerts.append({"level": "CAUTION", "icon": "⚠️",
+                            "message": f"Transit bump recorded ({shock:.1f}g)."})
+
+        tilt = transit.get("tilt_status", "")
+        if "INVERTED" in tilt or "CRITICAL TILT" in tilt:
+            alerts.append({"level": "WARNING", "icon": "📦",
+                            "message": f"CRATE TILT HAZARD: {tilt} — risk of crushing fruit under crate weight."})
+
+        if transit.get("road_condition") == "ROUGH_ROAD":
+            alerts.append({"level": "CAUTION", "icon": "🚛",
+                            "message": "Rough road transit active — ongoing vibration stress on fruit."})
+
+        if transit.get("severe_drops", 0) > 0 and transit.get("bruise_penalty_percent", 0) > 0:
+            alerts.append({"level": "WARNING", "icon": "📉",
+                            "message": f"Shelf life reduced by {transit.get('bruise_penalty_percent', 0):.0f}% due to handling drops."})
+
     return alerts
 
 
 # ---------------------------------------------------------------------------
 # Heuristic fallback (no trained model)
 # ---------------------------------------------------------------------------
-def compute_baseline_prediction(gas_raw: float, temp_c: float, humidity: float) -> Dict[str, Any]:
+def compute_baseline_prediction(gas_raw: float, temp_c: float, humidity: float, sample: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Domain-heuristic baseline for banana spoilage based on gas accumulation.
 
     Research-calibrated thresholds matching ESP32 MQ-3 in ambient air:
@@ -374,7 +584,23 @@ def compute_baseline_prediction(gas_raw: float, temp_c: float, humidity: float) 
         risk_level, risk_emoji = "CRITICAL", "🔴"
 
     trend = _trend_tracker.get_trend()
-    alerts = generate_alerts(label, adjusted_risk, risk_level, shelf_life, trend, gas_raw, temp_c)
+    
+    # Process transit telemetry
+    if sample:
+        _transit_tracker.add(sample)
+    transit = _transit_tracker.get_transit_state()
+
+    # Biological freshness vs Handling integrity dual scores
+    bio_freshness_score = round(max(0.0, min(100.0, 100.0 - adjusted_risk)), 1)
+    handling_integrity_score = transit.get("handling_integrity_score", 100.0)
+    composite_transit_score = round(0.60 * bio_freshness_score + 0.40 * handling_integrity_score, 1)
+
+    # Shock & bruise degradation on shelf life
+    bruise_penalty = transit.get("bruise_penalty_percent", 0.0) / 100.0
+    shelf_life_baseline = round(shelf_life, 2)
+    shelf_life_transit = round(max(0.05, shelf_life * (1.0 - bruise_penalty)), 2)
+
+    alerts = generate_alerts(label, adjusted_risk, risk_level, shelf_life_transit, trend, gas_raw, temp_c, transit)
 
     return {
         "label": label,
@@ -383,8 +609,13 @@ def compute_baseline_prediction(gas_raw: float, temp_c: float, humidity: float) 
         "risk_score": round(float(adjusted_risk), 1),
         "risk_level": risk_level,
         "risk_emoji": risk_emoji,
-        "shelf_life_days": round(shelf_life, 2),
-        "shelf_life_hours": round(shelf_life * 24, 1),
+        "shelf_life_days": shelf_life_transit,
+        "shelf_life_days_baseline": shelf_life_baseline,
+        "shelf_life_hours": round(shelf_life_transit * 24, 1),
+        "bio_freshness_score": bio_freshness_score,
+        "handling_integrity_score": handling_integrity_score,
+        "composite_transit_score": composite_transit_score,
+        "transit": transit,
         "trend": trend,
         "alerts": alerts,
         "model_source": "baseline_heuristic",
@@ -414,9 +645,11 @@ def predict_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
     temp = float(sample.get("temperature_c", 25.0))
     hum = float(sample.get("humidity_percent", 50.0))
 
-    # Track trend
+    # Track trend and transit telemetry
     _trend_tracker.add(sample)
     trend = _trend_tracker.get_trend()
+    _transit_tracker.add(sample)
+    transit = _transit_tracker.get_transit_state()
 
     # Try loading model bundle
     bundle, path = load_model_bundle()
@@ -467,8 +700,21 @@ def predict_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
                 label, probabilities, gas, temp, hum, trend
             )
 
-            # Alerts
-            alerts = generate_alerts(label, risk_score, risk_level, shelf_life_days, trend, gas, temp)
+            # Dual scores & bruise adjustment
+            bio_freshness_score = round(max(0.0, min(100.0, 100.0 - risk_score)), 1)
+            handling_integrity_score = transit.get("handling_integrity_score", 100.0)
+            composite_transit_score = round(0.60 * bio_freshness_score + 0.40 * handling_integrity_score, 1)
+
+            shelf_life_days_baseline = shelf_life_days
+            bruise_penalty = transit.get("bruise_penalty_percent", 0.0) / 100.0
+            shelf_life_days_transit = (
+                round(max(0.05, shelf_life_days * (1.0 - bruise_penalty)), 2)
+                if shelf_life_days is not None
+                else None
+            )
+
+            # Alerts with transit integration
+            alerts = generate_alerts(label, risk_score, risk_level, shelf_life_days_transit, trend, gas, temp, transit)
 
             return {
                 "label": label,
@@ -477,8 +723,13 @@ def predict_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
                 "risk_score": risk_score,
                 "risk_level": risk_level,
                 "risk_emoji": risk_emoji,
-                "shelf_life_days": shelf_life_days,
-                "shelf_life_hours": round(shelf_life_days * 24, 1) if shelf_life_days is not None else None,
+                "shelf_life_days": shelf_life_days_transit if shelf_life_days_transit is not None else shelf_life_days,
+                "shelf_life_days_baseline": shelf_life_days_baseline,
+                "shelf_life_hours": round(shelf_life_days_transit * 24, 1) if shelf_life_days_transit is not None else None,
+                "bio_freshness_score": bio_freshness_score,
+                "handling_integrity_score": handling_integrity_score,
+                "composite_transit_score": composite_transit_score,
+                "transit": transit,
                 "trend": trend,
                 "alerts": alerts,
                 "model_source": "trained_model",
@@ -490,7 +741,7 @@ def predict_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning("Model inference failed: %s; falling back to heuristic", exc)
 
     # Fallback to heuristic
-    return compute_baseline_prediction(gas, temp, hum)
+    return compute_baseline_prediction(gas, temp, hum, sample=sample)
 
 
 def predict_dataframe(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
@@ -504,4 +755,8 @@ def predict_dataframe(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         "temperature_c": float(latest_row["temperature_c"]),
         "humidity_percent": float(latest_row["humidity_percent"]),
     }
+    for k in ["accel_x", "accel_y", "accel_z", "shock_g", "pitch_deg", "roll_deg", "timestamp"]:
+        if k in latest_row and pd.notna(latest_row[k]):
+            sample[k] = latest_row[k]
+
     return predict_sample(sample)

@@ -37,6 +37,18 @@ def build_demo_dataset(seed: int = T.DEMO_SEED, rows: int = T.DEMO_ROWS) -> pd.D
     mq = 1620 + 3.2 * t + 38 * np.sin(t / 3.1) + rng.normal(0, 11, rows)       # raw ADC counts (0-4095)
     temp = 25.2 + 0.9 * np.sin(t / 7.5) + rng.normal(0, 0.12, rows)            # deg C
     hum = 64.0 + 2.6 * np.cos(t / 6.0) + rng.normal(0, 0.35, rows)             # % RH
+
+    # Realistic MPU-6050 transit vibrations & orientation
+    ax = rng.normal(0.02, 0.03, rows)
+    ay = rng.normal(-0.01, 0.03, rows)
+    az = rng.normal(0.99, 0.04, rows)
+    # Simulate a transit road bump around row 12
+    if rows > 12:
+        az[12] += 0.85
+    shock = np.sqrt(ax * ax + ay * ay + az * az)
+    pitch = np.degrees(np.arctan2(-ax, np.sqrt(ay * ay + az * az)))
+    roll = np.degrees(np.arctan2(ay, az))
+
     return pd.DataFrame(
         {
             "timestamp": ts,
@@ -44,6 +56,12 @@ def build_demo_dataset(seed: int = T.DEMO_SEED, rows: int = T.DEMO_ROWS) -> pd.D
             "gas_raw": np.rint(mq).astype(int),
             "temperature_c": np.round(temp, 1),
             "humidity_percent": np.round(hum, 1),
+            "accel_x": np.round(ax, 2),
+            "accel_y": np.round(ay, 2),
+            "accel_z": np.round(az, 2),
+            "shock_g": np.round(shock, 2),
+            "pitch_deg": np.round(pitch, 1),
+            "roll_deg": np.round(roll, 1),
             "source": T.DATA_SOURCE,
         }
     )
@@ -126,7 +144,7 @@ def dashboard(specimen: str | None) -> None:
             monitoring_status="LIVE · ESP32" if live else T.MONITORING_STATUS,
             observation_count=len(df),
             last_observation=last_ts,
-            data_source="ESP32 MQ-3 + DHT22" if live else T.DATA_SOURCE,
+            data_source="ESP32 Multi-Sensor (MQ-3, DHT22, MPU-6050)" if live else T.DATA_SOURCE,
         )
     )
     ui.render_readouts(latest, total=len(df), live=live)

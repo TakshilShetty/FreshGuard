@@ -83,6 +83,15 @@ def inject_css() -> None:
     .alert-caution { background: rgba(255,197,49,0.10); border-left: 3px solid #FFC531; }
     .alert-info { background: rgba(18,179,164,0.08); border-left: 3px solid #12B3A4; }
     .alert-urgent { background: rgba(255,91,87,0.15); border-left: 3px solid #FF5B57; }
+    .transit-metric { text-align: center; padding: 0.6rem 0; }
+    .transit-metric .val { font-size: 2.1rem; font-weight: 800; font-family: 'DM Sans', sans-serif; color: #17140D; }
+    .transit-metric .sub { font-size: 0.85rem; color: #6F6A60; margin-top: 0.2rem; }
+    .health-bar-row { margin: 0.4rem 0 0.6rem 0; }
+    .health-bar-header { display: flex; justify-content: space-between; font-size: 0.82rem; font-weight: 600; margin-bottom: 0.2rem; }
+    .health-bar-track { height: 0.75rem; background: #F0EBE0; border-radius: 0.4rem; overflow: hidden; }
+    .health-bar-fill { height: 100%; border-radius: 0.4rem; transition: width 0.5s ease; }
+    .incident-feed { max-height: 140px; overflow-y: auto; padding-right: 0.3rem; }
+    .incident-item { display: flex; justify-content: space-between; align-items: center; padding: 0.35rem 0.5rem; margin: 0.25rem 0; border-radius: 0.35rem; font-size: 0.80rem; background: rgba(0,0,0,0.03); }
     </style>""", unsafe_allow_html=True)
     _render(background_layer())
 
@@ -401,6 +410,147 @@ def render_ai_assessment(specimen_id: str, pred: dict, df: pd.DataFrame) -> None
               <div class="val" style="font-size:1.3rem">{trend.get('temp_avg', 0):.1f}°C / {trend.get('humidity_avg', 0):.0f}%</div>
               <div class="foot"><span class="note">Temp / Humidity average</span></div>
             </div>""")
+
+    # Transit & Handling Section (MPU-6050)
+    transit = pred.get("transit")
+    if transit:
+        render_transit_telemetry(transit, pred)
+
+
+# --------------------------------------------------------------------------- #
+# Transit & Handling Telemetry (MPU-6050)
+# --------------------------------------------------------------------------- #
+def render_transit_telemetry(transit: dict, pred: dict) -> None:
+    """Render physical transit telemetry: live g-force, tilt, vibration, and dual health scores."""
+    shock = transit.get("live_shock_g", 1.0)
+    peak = transit.get("peak_shock_g", 1.0)
+    pitch = transit.get("pitch_deg", 0.0)
+    roll = transit.get("roll_deg", 0.0)
+    tilt_status = transit.get("tilt_status", "LEVEL & UPRIGHT")
+    road = transit.get("road_condition", "STATIONARY")
+    rms = transit.get("vibration_rms", 0.0)
+    severe_drops = transit.get("severe_drops", 0)
+    mild_bumps = transit.get("mild_bumps", 0)
+    penalty = transit.get("bruise_penalty_percent", 0.0)
+
+    bio_score = pred.get("bio_freshness_score", 100.0 - pred.get("risk_score", 0.0))
+    handling_score = transit.get("handling_integrity_score", 100.0)
+    composite_score = pred.get("composite_transit_score", round(0.6 * bio_score + 0.4 * handling_score, 1))
+
+    # Shock status chip
+    if shock >= 2.5:
+        shock_tag = tag(f"CRITICAL DROP ({shock:.1f}g)", "crimson", dot=True, pulse=True)
+    elif shock >= 1.6:
+        shock_tag = tag(f"BUMP ({shock:.1f}g)", "amber", dot=True)
+    else:
+        shock_tag = tag(f"Normal ({shock:.2f}g)", "lime", dot=True)
+
+    # Tilt status chip
+    if "INVERTED" in tilt_status or "CRITICAL" in tilt_status:
+        tilt_tag = tag(tilt_status, "crimson", dot=True, pulse=True)
+    elif "MODERATE" in tilt_status:
+        tilt_tag = tag(tilt_status, "amber", dot=True)
+    else:
+        tilt_tag = tag("LEVEL & UPRIGHT", "lime")
+
+    # Road condition chip
+    if road == "ROUGH_ROAD":
+        road_tag = tag("ROUGH ROAD", "amber", dot=True)
+    elif road == "SMOOTH_HIGHWAY":
+        road_tag = tag("SMOOTH TRANSIT", "cyan", dot=True)
+    else:
+        road_tag = tag("STATIONARY", "lime")
+
+    _render(f"""
+    <div class="sw-panel" style="margin-top:0.8rem">
+      <div class="sw-title"><span class="idx">04</span>Transit Telemetry & Physical Handling (MPU-6050)
+        <span class="tag">{tag(f"Peak: {peak:.1f}g", "crimson" if peak >= 2.5 else "amber" if peak >= 1.6 else "lime")}</span>
+      </div>
+    </div>
+    """)
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        _render(f"""
+        <div class="sw-panel">
+          <div class="sw-title"><span class="idx">⚡</span>Impact / Shock</div>
+          <div class="transit-metric">
+            <div class="val">{shock:.2f} <small style="font-size:1.1rem;font-weight:600">g</small></div>
+            <div class="sub">Trip Peak: <b>{peak:.2f}g</b></div>
+            <div style="margin-top:0.4rem">{shock_tag}</div>
+            <div style="font-size:0.75rem;color:#6F6A60;margin-top:0.3rem">Drops: {severe_drops} | Bumps: {mild_bumps}</div>
+          </div>
+        </div>
+        """)
+
+    with m2:
+        _render(f"""
+        <div class="sw-panel">
+          <div class="sw-title"><span class="idx">📐</span>Crate Incline & Tilt</div>
+          <div class="transit-metric">
+            <div class="val">{abs(pitch):.0f}° <small style="font-size:1.1rem;font-weight:600">pitch</small></div>
+            <div class="sub">Roll: <b>{roll:+.1f}°</b></div>
+            <div style="margin-top:0.4rem">{tilt_tag}</div>
+            <div style="font-size:0.75rem;color:#6F6A60;margin-top:0.3rem">Anti-crushing orientation check</div>
+          </div>
+        </div>
+        """)
+
+    with m3:
+        _render(f"""
+        <div class="sw-panel">
+          <div class="sw-title"><span class="idx">🚛</span>Road Vibration</div>
+          <div class="transit-metric">
+            <div class="val">{rms:.2f} <small style="font-size:1.1rem;font-weight:600">RMS</small></div>
+            <div class="sub">Vibration Stress</div>
+            <div style="margin-top:0.4rem">{road_tag}</div>
+            <div style="font-size:0.75rem;color:#6F6A60;margin-top:0.3rem">Continuous mechanical agitation</div>
+          </div>
+        </div>
+        """)
+
+    with m4:
+        # Dual health score bars
+        bio_color = "#12B3A4" if bio_score >= 60 else "#FFC531" if bio_score >= 35 else "#FF5B57"
+        hnd_color = "#12B3A4" if handling_score >= 75 else "#FF8C00" if handling_score >= 50 else "#FF5B57"
+        _render(f"""
+        <div class="sw-panel">
+          <div class="sw-title"><span class="idx">🛡️</span>Dual Quality Index</div>
+          <div style="padding:0.3rem 0">
+            <div class="health-bar-row">
+              <div class="health-bar-header"><span>🍏 Bio-Freshness</span><span style="color:{bio_color}">{bio_score:.0f}%</span></div>
+              <div class="health-bar-track"><div class="health-bar-fill" style="width:{bio_score:.0f}%;background:{bio_color}"></div></div>
+            </div>
+            <div class="health-bar-row">
+              <div class="health-bar-header"><span>📦 Handling Integrity</span><span style="color:{hnd_color}">{handling_score:.0f}%</span></div>
+              <div class="health-bar-track"><div class="health-bar-fill" style="width:{handling_score:.0f}%;background:{hnd_color}"></div></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:0.75rem;color:#6F6A60;margin-top:0.2rem">
+              <span>Bruise Penalty: <b>-{penalty:.0f}%</b></span>
+              <span>Composite: <b>{composite_score:.0f}%</b></span>
+            </div>
+          </div>
+        </div>
+        """)
+
+    # Incident Log row if incidents exist
+    incidents = transit.get("incident_log", [])
+    if incidents:
+        rows_html = ""
+        for inc in incidents[:4]:
+            t_color = "#FF5B57" if inc["level"] == "CRITICAL" else "#FF8C00" if inc["level"] == "WARNING" else "#FFC531"
+            rows_html += f"""
+            <div class="incident-item">
+              <span><b>{_e(inc['timestamp'])}</b> — {inc['icon']} {_e(inc['message'])}</span>
+              <span style="color:{t_color};font-weight:700">{_e(inc['severity'])}</span>
+            </div>
+            """
+        _render(f"""
+        <div class="sw-panel" style="margin-top:0.5rem">
+          <div class="sw-title"><span class="idx">⚠️</span>Recent Handling Incidents & Shock Log</div>
+          <div class="incident-feed">{rows_html}</div>
+        </div>
+        """)
 
 
 # --------------------------------------------------------------------------- #

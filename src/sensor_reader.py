@@ -18,9 +18,15 @@ ADC_MAX = 4095
 
 
 def parse_line(line: str) -> Optional[dict]:
-    """Return {'gas_raw','temperature_c','humidity_percent'} or None if the line is not a reading."""
+    """Return dict with sensor readings or None if the line is not a reading.
+    
+    Supports:
+    - 3-field standard: gas_raw,temperature_c,humidity_percent
+    - 7-field IMU: gas_raw,temperature_c,humidity_percent,accel_x,accel_y,accel_z,shock_g
+    - 9-field IMU with tilt: gas_raw,temperature_c,humidity_percent,accel_x,accel_y,accel_z,shock_g,pitch_deg,roll_deg
+    """
     parts = line.strip().split(",")
-    if len(parts) != 3:
+    if len(parts) not in (3, 7, 9):
         return None
     try:
         gas, temp, hum = float(parts[0]), float(parts[1]), float(parts[2])
@@ -28,7 +34,23 @@ def parse_line(line: str) -> Optional[dict]:
         return None
     if not all(math.isfinite(v) for v in (gas, temp, hum)) or not 0 <= gas <= ADC_MAX or not 0 <= hum <= 100:
         return None
-    return {"gas_raw": int(round(gas)), "temperature_c": temp, "humidity_percent": hum}
+    
+    data: dict[str, Any] = {"gas_raw": int(round(gas)), "temperature_c": temp, "humidity_percent": hum}
+    if len(parts) >= 7:
+        try:
+            ax, ay, az, shock = float(parts[3]), float(parts[4]), float(parts[5]), float(parts[6])
+            if all(math.isfinite(v) for v in (ax, ay, az, shock)):
+                data.update({"accel_x": ax, "accel_y": ay, "accel_z": az, "shock_g": shock})
+        except ValueError:
+            pass
+    if len(parts) == 9:
+        try:
+            pitch, roll = float(parts[7]), float(parts[8])
+            if all(math.isfinite(v) for v in (pitch, roll)):
+                data.update({"pitch_deg": pitch, "roll_deg": roll})
+        except ValueError:
+            pass
+    return data
 
 
 class StreamParser:
@@ -56,13 +78,21 @@ class StreamParser:
         if h_m:
             self._buffer["humidity_percent"] = float(h_m.group(1))
 
+        shock_m = re.search(r"(?:Shock|Impact|Accel(?:eration)?)\s*[:=]\s*([0-9.]+)", line, re.IGNORECASE)
+        if shock_m:
+            self._buffer["shock_g"] = float(shock_m.group(1))
+
         if "gas_raw" in self._buffer and "temperature_c" in self._buffer and "humidity_percent" in self._buffer:
             g = self._buffer["gas_raw"]
             t = self._buffer["temperature_c"]
             h = self._buffer["humidity_percent"]
+            shock = self._buffer.get("shock_g")
             self._buffer.clear()
             if 0 <= g <= ADC_MAX and 0 <= h <= 100 and math.isfinite(t):
-                return {"gas_raw": int(g), "temperature_c": t, "humidity_percent": h}
+                row = {"gas_raw": int(g), "temperature_c": t, "humidity_percent": h}
+                if shock is not None and math.isfinite(shock):
+                    row["shock_g"] = float(shock)
+                return row
         return None
 
 
@@ -103,7 +133,9 @@ def build_dataframe(samples: list[dict], specimen_id: str, label: Optional[str] 
     df["specimen_id"] = specimen_id
     df["source"] = SOURCE_LABEL
     cols = ["timestamp", "sample_id", "specimen_id", "gas_raw", "temperature_c", "humidity_percent", "source"]
-    if label:
-        df["spoilage_label"] = label
+    for extra in ["accel_x", "accel_y", "accel_z", "shock_g", "pitch_deg", "roll_deg"]:
+        if extra in df.columns:
+            cols.append(extra)
+    if label and "spoilage_label" in df.columns:
         cols.append("spoilage_label")
     return df[cols]

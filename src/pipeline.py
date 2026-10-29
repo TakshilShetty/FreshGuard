@@ -176,10 +176,19 @@ class LivePipeline:
             "risk_level": ai_result.get("risk_level"),
             "shelf_life_days": ai_result.get("shelf_life_days"),
             "shelf_life_hours": ai_result.get("shelf_life_hours"),
+            "bio_freshness_score": ai_result.get("bio_freshness_score"),
+            "handling_integrity_score": ai_result.get("handling_integrity_score"),
+            "composite_transit_score": ai_result.get("composite_transit_score"),
+            "transit": ai_result.get("transit", {}),
             "model_source": ai_result.get("model_source"),
             "alerts": ai_result.get("alerts", []),
             "processed": ai_result,
         }
+
+        # Include IMU & Orientation fields if present
+        for imu_key in ["accel_x", "accel_y", "accel_z", "shock_g", "pitch_deg", "roll_deg"]:
+            if imu_key in raw_reading:
+                document[imu_key] = raw_reading[imu_key]
 
         # 3. Cache in memory
         cached_copy = dict(document)
@@ -307,6 +316,15 @@ class LivePipeline:
                             # Print alerts
                             for alert in pred.get("alerts", []):
                                 print(f"   {alert['icon']} [{alert['level']}] {alert['message']}")
+
+                            # Hardware Actuator Feedback (Collaborator Request #2: Red LED / Buzzer)
+                            try:
+                                if risk_lvl == "CRITICAL" or pred.get("transit", {}).get("live_shock_g", 1.0) >= 2.5:
+                                    ser.write(b"ALERT:ON\n")
+                                else:
+                                    ser.write(b"ALERT:OFF\n")
+                            except Exception:
+                                pass
 
             except serial.SerialException as s_err:
                 logger.warning("Serial error on %s: %s. Reconnecting in 3s...", self.port, s_err)
