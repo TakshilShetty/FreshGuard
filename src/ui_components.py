@@ -74,7 +74,7 @@ def _clock_markup() -> str:
     )
 
 
-def render_header() -> None:
+def render_header(live: bool = False) -> None:
     """Banana wordmark + in-page navigation + honest status chips."""
     clock = _clock_markup()
     _render(
@@ -88,8 +88,8 @@ def render_header() -> None:
             <a href="#sw-obs">Observations</a><a href="#sw-activity">Activity</a></nav>
           <div class="sw-hstatus">
             <div class="sw-hcell"><span class="sw-label">Local time</span>{clock}</div>
-            <div class="sw-hcell"><span class="sw-label">Data source</span>{tag("Simulated", "cyan")}</div>
-            <div class="sw-demo-badge">DEMO MODE</div>
+            <div class="sw-hcell"><span class="sw-label">Data source</span>{tag("ESP32 live", "lime") if live else tag("Simulated", "cyan")}</div>
+            <div class="sw-demo-badge">{"LIVE" if live else "DEMO MODE"}</div>
           </div>
         </div>
         """
@@ -128,7 +128,7 @@ def render_hero(info: SpecimenInfo) -> None:
                 <div class="sw-h1">Bananas don&rsquo;t spoil in <span class="sw-mark">silence.</span></div>
                 <div class="sw-hero-id">{_e(prefix)}-<span>{_e(num)}</span></div>
                 <div class="sw-hero-exp">EXPERIMENT // {_e(info.experiment_id)}</div>
-                <div class="sw-explain" style="margin-top:.8rem;max-width:32rem">Specimen under <b>simulated</b> observation. No physical sensor is attached and no real measurements are being recorded.</div>
+                <div class="sw-explain" style="margin-top:.8rem;max-width:32rem">{"Specimen under <b>live</b> observation: real ESP32 sensor readings, refreshed every few seconds." if info.data_source != T.DATA_SOURCE else "Specimen under <b>simulated</b> observation. No physical sensor is attached and no real measurements are being recorded."}</div>
               </div>
               <div class="sw-meta">
                 <div><span class="sw-label">Monitoring status</span><div class="v">{_e(info.monitoring_status)}</div></div>
@@ -194,7 +194,7 @@ def render_readouts(latest: Optional[pd.Series], total: int) -> None:
 # --------------------------------------------------------------------------- #
 # assessment
 # --------------------------------------------------------------------------- #
-def render_assessment(specimen_id: str, model_trained: bool, timestamp: str) -> None:
+def render_assessment(specimen_id: str, model_trained: bool, timestamp: str, prediction: Optional[dict] = None, live: bool = False) -> None:
     """Assessment panel. Shows the unavailable state until a validated model exists.
 
     A later stage can replace the ``sw-slot`` block with a real assessment; the
@@ -203,22 +203,22 @@ def render_assessment(specimen_id: str, model_trained: bool, timestamp: str) -> 
     body = f"""
     <div class="sw-assess">
       <div class="big">{"MODEL AVAILABLE" if model_trained else "MODEL NOT TRAINED"}</div>
-      <div class="sub">NO VALIDATED SPOILAGE PREDICTION AVAILABLE</div>
+      <div class="sub">{"MODEL OUTPUT: " + _e(prediction["label"]).upper() if prediction else "NO VALIDATED SPOILAGE PREDICTION AVAILABLE"}</div>
     </div>
     <div class="sw-assess-grid">
-      <div><span class="sw-label">Assessment status</span><div class="v">{tag("Not available", "amber")}</div></div>
+      <div><span class="sw-label">Assessment status</span><div class="v">{tag("Available", "lime") if prediction else tag("Not available", "amber")}</div></div>
       <div><span class="sw-label">Model availability</span><div class="v">{tag("Available" if model_trained else "Unavailable", "lime" if model_trained else "crimson")}</div></div>
       <div><span class="sw-label">Specimen</span><div class="v">{_e(specimen_id)}</div></div>
       <div><span class="sw-label">Timestamp</span><div class="v">{_e(timestamp)}</div></div>
-      <div><span class="sw-label">Prediction</span><div class="v" style="color:#6F6A60">— — —</div></div>
-      <div><span class="sw-label">Confidence</span><div class="v" style="color:#6F6A60">— — —</div></div>
+      <div><span class="sw-label">Prediction</span><div class="v">{_e(prediction["label"]) if prediction else "— — —"}</div></div>
+      <div><span class="sw-label">Confidence</span><div class="v">{f'{prediction["confidence"]:.0%}' if prediction and prediction.get("confidence") is not None else "— — —"}</div></div>
     </div>
     <div class="sw-explain">
       <b>Why there is no assessment.</b> No model has been trained and no real dataset has been collected,
       so the system has nothing validated to base a freshness call on. The MQ-3 is an alcohol/vapour
       gas sensor, not a banana-specific spoilage detector &mdash; a changing reading alone
-      cannot show that fruit is spoiled. Values on this screen are <b>simulated</b> and are never
-      interpreted as fresh or spoiled.
+      cannot show that fruit is spoiled. Values on this screen are <b>{"live sensor readings" if live else "simulated"}</b> and are never
+      interpreted as fresh or spoiled until a validated model exists.
     </div>
     <div class="sw-slot"><span class="sw-label">Assessment output slot</span>{tag("Reserved · awaiting validated model", "amber")}</div>
     """

@@ -1,9 +1,10 @@
 """One command to run everything: MongoDB check, Streamlit, Caddy reverse proxy, mDNS name.
 
-    python start.py        (Ctrl+C stops what it started)
+    python start.py                    (Ctrl+C stops what it started)
+    python start.py --port COM5        (also ingests the ESP32 into MongoDB)
 Dashboard: http://freshguard.local  (or http://<wifi-ip> for devices without mDNS).
 """
-import os, socket, subprocess, sys, tempfile, time
+import argparse, os, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
@@ -26,6 +27,8 @@ def up(port: int) -> bool:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(); ap.add_argument("--port"); ap.add_argument("--specimen", default="BANANA-LIVE")
+    a = ap.parse_args()
     if not up(27017):
         sys.exit("MongoDB is not running on 27017 - start the 'MongoDB' Windows service (admin: net start MongoDB).")
     ip = wifi_ip()
@@ -36,6 +39,8 @@ def main() -> None:
                           "--server.address", "127.0.0.1", "--server.headless", "true"], cwd=HERE),
         subprocess.Popen(["caddy", "run", "--config", str(caddyfile), "--adapter", "caddyfile"]),
     ]
+    if a.port:
+        procs.append(subprocess.Popen([sys.executable, "ingest.py", "--port", a.port, "--specimen", a.specimen], cwd=HERE))
     zc = Zeroconf(ip_version=IPVersion.V4Only)
     zc.register_service(ServiceInfo("_http._tcp.local.", f"{NAME}._http._tcp.local.", addresses=[socket.inet_aton(ip)],
                                     port=80, server=f"{NAME}.local."))
