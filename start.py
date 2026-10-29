@@ -1,25 +1,42 @@
-"""One command to run everything: MongoDB check, Streamlit, Caddy reverse proxy, mDNS name.
+"""One command to run everything: MongoDB check, Streamlit, FastAPI backend, Caddy, and ESP32 AI Pipeline.
 
-    python start.py                    (Ctrl+C stops what it started)
-    python start.py --port COM5        (also ingests the ESP32 into MongoDB)
-Dashboard: http://freshguard.local  (or http://<wifi-ip> for devices without mDNS).
+Usage:
+    python start.py                    (auto-detects ESP32 on COM port, starts UI + API + Pipeline)
+    python start.py --port COM5        (explicit port)
+    python start.py --no-ingest        (start frontend & backend without serial hardware)
+
+Endpoints:
+    Dashboard:   http://localhost:5000  (or http://freshguard.local)
+    Backend API: http://localhost:8000  (API Docs: http://localhost:8000/docs)
 """
-import argparse, os, socket, subprocess, sys, tempfile, time
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 from src.config import DEFAULT_SPECIMEN, MDNS_NAME, PORT
+from src.sensor_reader import list_ports
 
 NAME = MDNS_NAME
 HERE = Path(__file__).parent
 
 
 def wifi_ip() -> str:
-    # ponytail: default-route interface; assumes the hotspot is the active route
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect(("10.255.255.255", 1))
-        return s.getsockname()[0]
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
 
 
 def up(port: int) -> bool:
@@ -28,35 +45,128 @@ def up(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def detect_esp32_port() -> str | None:
+    ports = list_ports()
+    if not ports:
+        return None
+    for p in ports:
+        dev = p.split()[0]
+        desc = p.lower()
+        if "cp210" in desc or "ch340" in desc or "esp32" in desc or "usb-to-uart" in desc:
+            return dev
+    return ports[0].split()[0]
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port")
-    ap.add_argument("--specimen", default=DEFAULT_SPECIMEN)
+    ap = argparse.ArgumentParser(description="Start FreshGuard Full Stack (Frontend, Backend API, and Hardware Pipeline)")
+    ap.add_argument("--port", help="ESP32 serial COM port (e.g. COM5)")
+    ap.add_argument("--specimen", default=DEFAULT_SPECIMEN, help=f"Specimen label (default: {DEFAULT_SPECIMEN})")
+    ap.add_argument("--no-ingest", action="store_true", help="Do not start serial ingestion pipeline")
+    ap.add_argument("--no-api", action="store_true", help="Do not start FastAPI backend server")
     a = ap.parse_args()
+
     if not up(27017):
-        sys.exit("MongoDB is not running on 27017 - start the 'MongoDB' Windows service (admin: net start MongoDB).")
+        sys.exit("MongoDB is not running on port 27017. Please start MongoDB service (net start MongoDB).")
+
+    procs: list[subprocess.Popen] = []
+
+    # 1. Start Streamlit Frontend
+    procs.append(
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "streamlit",
+                "run",
+                "app.py",
+                "--server.port",
+                str(PORT),
+                "--server.address",
+                "127.0.0.1",
+                "--server.headless",
+                "true",
+            ],
+            cwd=HERE,
+        )
+    )
+
+    # 2. Start FastAPI Backend REST API Server
+    if not a.no_api:
+        procs.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "src.server:app",
+                    "--port",
+                    "8000",
+                    "--host",
+                    "0.0.0.0",
+                ],
+                cwd=HERE,
+            )
+        )
+
+    # 3. Start Caddy reverse proxy (if available)
+    if shutil.which("caddy"):
+        caddyfile = Path(tempfile.gettempdir()) / "freshguard.Caddyfile"
+        caddyfile.write_text(f":80 {{\n\treverse_proxy 127.0.0.1:{PORT}\n}}\n")
+        try:
+            procs.append(subprocess.Popen(["caddy", "run", "--config", str(caddyfile), "--adapter", "caddyfile"]))
+        except Exception:
+            pass
+
+    # 4. Start Hardware Ingestion Pipeline
+    if not a.no_ingest:
+        port = a.port or detect_esp32_port()
+        if port:
+            ingest_script = HERE / "scripts" / "ingest.py"
+            if not ingest_script.exists():
+                ingest_script = HERE / "ingest.py"
+            print(f"[*] Attaching ESP32 on {port} -> Live AI Ingestion Pipeline")
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, str(ingest_script), "--port", port, "--specimen", a.specimen],
+                    cwd=HERE,
+                )
+            )
+        else:
+            print("[!] No ESP32 COM port found. Running without live hardware ingestion.")
+
+    # 5. mDNS Zeroconf registration
     ip = wifi_ip()
-    caddyfile = Path(tempfile.gettempdir()) / "freshguard.Caddyfile"
-    caddyfile.write_text(f":80 {{\n\treverse_proxy 127.0.0.1:{PORT}\n}}\n")
-    procs = [
-        subprocess.Popen([sys.executable, "-m", "streamlit", "run", "app.py", "--server.port", str(PORT),
-                          "--server.address", "127.0.0.1", "--server.headless", "true"], cwd=HERE),
-        subprocess.Popen(["caddy", "run", "--config", str(caddyfile), "--adapter", "caddyfile"]),
-    ]
-    if a.port:
-        ingest_script = "scripts/ingest.py" if (HERE / "scripts" / "ingest.py").exists() else "ingest.py"
-        procs.append(subprocess.Popen([sys.executable, str(HERE / ingest_script), "--port", a.port, "--specimen", a.specimen], cwd=HERE))
     zc = Zeroconf(ip_version=IPVersion.V4Only)
-    zc.register_service(ServiceInfo("_http._tcp.local.", f"{NAME}._http._tcp.local.", addresses=[socket.inet_aton(ip)],
-                                    port=80, server=f"{NAME}.local."))
-    print(f"\nFreshGuard up:  http://{NAME}.local   |   http://{ip}   (Ctrl+C to stop)\n")
+    try:
+        zc.register_service(
+            ServiceInfo(
+                "_http._tcp.local.",
+                f"{NAME}._http._tcp.local.",
+                addresses=[socket.inet_aton(ip)],
+                port=80,
+                server=f"{NAME}.local.",
+            )
+        )
+    except Exception:
+        pass
+
+    print("\n=======================================================")
+    print(f" FreshGuard System Running Successfully!")
+    print(f"=======================================================")
+    print(f" Frontend Dashboard:  http://localhost:{PORT}  |  http://{NAME}.local")
+    if not a.no_api:
+        print(f" Backend REST API:    http://localhost:8000  (Docs: http://localhost:8000/docs)")
+    print(f" Network Access:      http://{ip}")
+    print(f" Press Ctrl+C to terminate all services.\n")
+
     try:
         while all(p.poll() is None for p in procs):
             time.sleep(1)
     except KeyboardInterrupt:
-        pass
+        print("\nStopping FreshGuard services...")
     finally:
-        zc.unregister_all_services(); zc.close()
+        zc.unregister_all_services()
+        zc.close()
         for p in procs:
             p.terminate()
 

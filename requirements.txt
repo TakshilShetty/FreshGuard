@@ -6,3 +6,6 @@ pytest
 pyserial
 pymongo
 zeroconf
+scikit-learn
+fastapi
+uvicorn

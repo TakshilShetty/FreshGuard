@@ -1,20 +1,29 @@
-"""AI hook. predict(df) -> {"label": str, "confidence": float} or None when no trained model exists.
+"""AI hook. predict(df) -> {"label": str, "confidence": float, ...} or None when no trained model exists.
 
-Drop a joblib model at models/model.joblib exposing predict(X)/predict_proba(X) over
-[gas_raw, temperature_c, humidity_percent] (latest row), or replace this function.
+Integrates with src.ai_engine to support collaborator-trained models in models/model.joblib,
+as well as dynamic hot-reloading and fallback baseline heuristics.
 """
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Any, Dict, Optional
 
-MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "model.joblib"
-FEATURES = ["gas_raw", "temperature_c", "humidity_percent"]
+import pandas as pd
+
+from src.ai_engine import (
+    MODELS_DIR,
+    PRIMARY_MODEL_PATH,
+    STANDARD_FEATURES,
+    get_model_file,
+    predict_dataframe,
+)
+
+MODEL_PATH = PRIMARY_MODEL_PATH
+FEATURES = STANDARD_FEATURES
 
 
-def predict(df):
-    if not MODEL_PATH.exists() or df.empty:
+def predict(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """Predict spoilage stage and confidence for the latest row of df."""
+    if df.empty:
         return None
-    import joblib  # lazy: only needed once a model exists
-
-    model = joblib.load(MODEL_PATH)
-    x = df[FEATURES].tail(1)
-    proba = model.predict_proba(x)[0] if hasattr(model, "predict_proba") else None
-    return {"label": str(model.predict(x)[0]), "confidence": float(proba.max()) if proba is not None else None}
+    return predict_dataframe(df)

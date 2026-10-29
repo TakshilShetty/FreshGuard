@@ -1,7 +1,7 @@
 import pandas as pd
 from src.data_manager import save_dataset
 from src.data_validator import validate_sensor_data
-from src.sensor_reader import build_dataframe, parse_line
+from src.sensor_reader import StreamParser, build_dataframe, parse_line
 
 
 def test_parse_good_line():
@@ -19,3 +19,18 @@ def test_real_rows_validate_and_save(tmp_path):
     assert "spoilage_label" not in df.columns
     assert validate_sensor_data(df, expected_origin="real").is_valid
     assert save_dataset(df, tmp_path / "data" / "raw" / "t.csv", origin="real").saved
+
+
+def test_stream_parser_csv_and_multiline():
+    parser = StreamParser()
+    # Test CSV parsing
+    csv_row = parser.feed("1920,25.4,62.1\n")
+    assert csv_row == {"gas_raw": 1920, "temperature_c": 25.4, "humidity_percent": 62.1}
+
+    # Test multiline block parsing
+    assert parser.feed("-------------------------\n") is None
+    assert parser.feed("MQ-3 Sensor Value: 914\n") is None
+    assert parser.feed("Temperature: 28.80 °C\n") is None
+    res = parser.feed("Humidity: 52.30 %\n")
+    assert res == {"gas_raw": 914, "temperature_c": 28.8, "humidity_percent": 52.3}
+

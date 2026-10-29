@@ -1,11 +1,13 @@
 """Read ESP32 serial lines and turn them into a validator-ready DataFrame.
 
-Line format sent by firmware/esp32_sensor: ``gas_raw,temperature_c,humidity_percent``.
+Line format sent by firmware/esp32_sensor: ``gas_raw,temperature_c,humidity_percent``
+or formatted multi-line test stream (MQ-3 Sensor Value: ..., Temperature: ..., Humidity: ...).
 Nothing here invents data: unreadable lines are skipped, never guessed.
 """
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -29,6 +31,41 @@ def parse_line(line: str) -> Optional[dict]:
     return {"gas_raw": int(round(gas)), "temperature_c": temp, "humidity_percent": hum}
 
 
+class StreamParser:
+    """Stateful stream parser that processes both CSV and multi-line formatted serial streams."""
+
+    def __init__(self) -> None:
+        self._buffer: dict[str, float | int] = {}
+
+    def feed(self, line: str) -> Optional[dict]:
+        # 1. Try single-line CSV format first
+        direct = parse_line(line)
+        if direct is not None:
+            return direct
+
+        # 2. Key-value multi-line stream pattern matching
+        mq_m = re.search(r"MQ[-_ ]?3(?:.*?Value)?\s*[:=]\s*(\d+)", line, re.IGNORECASE)
+        if mq_m:
+            self._buffer["gas_raw"] = int(mq_m.group(1))
+
+        t_m = re.search(r"Temp(?:erature)?\s*[:=]\s*([0-9.]+)", line, re.IGNORECASE)
+        if t_m:
+            self._buffer["temperature_c"] = float(t_m.group(1))
+
+        h_m = re.search(r"Hum(?:idity)?\s*[:=]\s*([0-9.]+)", line, re.IGNORECASE)
+        if h_m:
+            self._buffer["humidity_percent"] = float(h_m.group(1))
+
+        if "gas_raw" in self._buffer and "temperature_c" in self._buffer and "humidity_percent" in self._buffer:
+            g = self._buffer["gas_raw"]
+            t = self._buffer["temperature_c"]
+            h = self._buffer["humidity_percent"]
+            self._buffer.clear()
+            if 0 <= g <= ADC_MAX and 0 <= h <= 100 and math.isfinite(t):
+                return {"gas_raw": int(g), "temperature_c": t, "humidity_percent": h}
+        return None
+
+
 def list_ports() -> list[str]:
     from serial.tools import list_ports as lp
     return [f"{p.device}  ({p.description})" for p in lp.comports()]
@@ -38,13 +75,14 @@ def read_samples(port: str, baud: int = 115200, seconds: float = 600, on_sample:
     """Collect readings for ``seconds`` (Ctrl+C stops early and keeps what was read)."""
     import serial  # pyserial, imported lazily so tests need no hardware
 
+    parser = StreamParser()
     samples: list[dict] = []
     end = datetime.now().timestamp() + seconds
     try:
         with serial.Serial(port, baud, timeout=3) as ser:
             ser.reset_input_buffer()
             while datetime.now().timestamp() < end:
-                row = parse_line(ser.readline().decode("utf-8", errors="ignore"))
+                row = parser.feed(ser.readline().decode("utf-8", errors="ignore"))
                 if row:
                     row["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     samples.append(row)
